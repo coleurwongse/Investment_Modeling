@@ -1,9 +1,9 @@
-from scipy.stats import truncnorm
+from scipy.stats import truncnorm, t
 import usstock
 import statistics
 import random
-import sys
 from collections import defaultdict
+
 
 # ============================================================
 # PORTFOLIO ALLOCATIONS
@@ -11,33 +11,94 @@ from collections import defaultdict
 
 INITIAL_PERCENT_S_AND_P = 0.64
 INITIAL_PERCENT_BONDS = 0.34
+INITIAL_PERCENT_REITS = 0.0
 INITIAL_PERCENT_ASSETS = 0.02
 
 LATER_PERCENT_S_AND_P = 0.45
 LATER_PERCENT_BONDS = 0.55
+LATER_PERCENT_REITS = 0.0
 LATER_PERCENT_ASSETS = 0.0
 
 INITIAL_STOCKS_LIST = []
 LATER_STOCKS_LIST = []
 
-VARIABLE_CONTRIBUTION = 200000
+
+# ============================================================
+# CONTRIBUTIONS / WITHDRAWALS
+# ============================================================
+
+INITIAL_CONTRIBUTION = 150000
+VARIABLE_WITHDRAWAL = 200000
+ANNUAL_WITHDRAWAL = 50000
 
 
-# Example:
-# INITIAL_STOCKS_LIST = [
-#     ("NVDA", 0.1),
-#     ("MSFT", 0.2),
-#     ("WMT", 0.2),
-#     ("GOOGL", 0.1),
-#     ("COST", 0.1)
-# ]
+# ============================================================
+# MODEL PARAMETERS
+# ============================================================
 
-# LATER_STOCKS_LIST = [
-#     ("NVDA", 0.03),
-#     ("WMT", 0.1),
-#     ("GOOGL", 0.07),
-#     ("COST", 0.1)
-# ]
+# Long-run return toward which individual-stock historical
+# means are shrunk.
+STOCK_TARGET_RETURN = 0.08
+
+# 50% historical mean / 50% long-run target.
+STOCK_MEAN_SHRINKAGE = 0.50
+
+# Student-t degrees of freedom.
+# Lower = fatter tails.
+STOCK_T_DF = 5
+
+# Winsorization limits for historical stock returns.
+STOCK_LOWER_PERCENTILE = 0.05
+STOCK_UPPER_PERCENTILE = 0.95
+
+# REIT model
+REIT_MEAN = 8.24
+REIT_STD = 19.07
+
+
+# ============================================================
+# HISTORICAL 1-YEAR TREASURY BILL RATES
+# ============================================================
+#
+# Annual average 1-year Treasury Bill rates.
+#
+# Values are percentages.
+#
+# Source: Federal Reserve H.15 / historical series used by
+# Macrotrends.
+#
+# These are used as historical observations from which the
+# simulation randomly selects a year's T-bill return.
+# ============================================================
+
+TREASURY_BILL_RATES = [
+    4.64, 3.42, 2.81, 3.01, 3.30, 3.75, 4.06, 5.07,
+    4.70, 5.46, 6.79, 6.49, 4.67, 4.76, 7.02, 7.72,
+    6.30, 5.52, 5.70, 7.74, 9.73, 10.85, 13.16, 11.07,
+    8.80, 9.94, 7.81, 6.07, 6.33, 7.13, 7.92, 7.35,
+    5.52, 3.71, 3.29, 5.02, 5.60, 5.22, 5.32, 4.80,
+    4.81, 5.78, 3.84, 1.67,
+
+    # 2003-2007
+    1.05, 1.57, 3.39, 4.81, 4.45,
+
+    # 2008-2025
+    1.63, 0.45, 0.30, 0.17, 0.17, 0.13, 0.11,
+    0.30, 0.60, 1.17, 2.25, 1.99, 0.36, 0.10,
+    2.68, 4.84, 4.48, 3.76
+]
+
+
+def simulated_tbill_return():
+    """
+    Randomly selects a historical annual 1-year Treasury
+    Bill rate.
+
+    Returns decimal:
+        0.045 = 4.5%
+    """
+
+    return random.choice(TREASURY_BILL_RATES) / 100
 
 
 # ============================================================
@@ -45,15 +106,6 @@ VARIABLE_CONTRIBUTION = 200000
 # ============================================================
 
 def stock_data(ticker_list):
-    """
-    Returns historical calendar-year returns.
-
-    Returns are stored as DECIMALS:
-        0.10  = +10%
-       -0.20  = -20%
-
-    Uses adjusted close when available.
-    """
 
     annual_returns = []
 
@@ -77,13 +129,6 @@ def stock_data(ticker_list):
 
         temp_stock_returns = []
 
-        # ----------------------------------------------------
-        # Calculate each calendar year's return.
-        #
-        # We use the previous year's final price as the
-        # starting price for the current year.
-        # ----------------------------------------------------
-
         previous_year_end = None
 
         for year in years:
@@ -93,20 +138,19 @@ def stock_data(ticker_list):
             if not year_rows:
                 continue
 
-            # Prefer adjusted close if the API supplies it.
             first_row = year_rows[0]
             last_row = year_rows[-1]
 
             start_price = (
-                    first_row.get("adjusted_close")
-                    or first_row.get("adjclose")
-                    or first_row.get("close")
+                first_row.get("adjusted_close")
+                or first_row.get("adjclose")
+                or first_row.get("close")
             )
 
             end_price = (
-                    last_row.get("adjusted_close")
-                    or last_row.get("adjclose")
-                    or last_row.get("close")
+                last_row.get("adjusted_close")
+                or last_row.get("adjclose")
+                or last_row.get("close")
             )
 
             if start_price is None or end_price is None:
@@ -118,11 +162,11 @@ def stock_data(ticker_list):
             if end_price <= 0:
                 continue
 
-            # For the first available year, we can't calculate
-            # a true calendar-year return without the previous
-            # year's closing price.
             if previous_year_end is not None and previous_year_end > 0:
-                annual_return = (end_price / previous_year_end) - 1
+
+                annual_return = (
+                    end_price / previous_year_end
+                ) - 1
 
                 temp_stock_returns.append(annual_return)
 
@@ -134,21 +178,11 @@ def stock_data(ticker_list):
 
 
 # ============================================================
-# TRUNCATED NORMAL DISTRIBUTIONS
+# S&P 500 MODEL
 # ============================================================
 
 def simulated_sp_return():
-    """
-    Returns a randomly selected historical S&P 500 annual
-    total return.
 
-    Returns are decimals:
-        0.10  = +10%
-       -0.20  = -20%
-    """
-
-    # Historical S&P 500 annual total returns, 1928-2025.
-    # Values are decimals.
     historical_returns = [
         0.4381, -0.0830, -0.2512, -0.4384, -0.0864,
         0.4959, -0.4770, -0.4284, -0.5309, 0.3655,
@@ -179,18 +213,26 @@ def simulated_sp_return():
 
     return random.choice(historical_returns)
 
+
+# ============================================================
+# REIT MODEL
+# ============================================================
+
+def simulated_reit_return():
+
+    return truncnorm.rvs(
+        -5.43,
+        7.42,
+        loc=REIT_MEAN,
+        scale=REIT_STD
+    ) / 100
+
+
+# ============================================================
+# OTHER ASSET MODEL / GOLD
+# ============================================================
+
 def simulated_asset_return():
-    """
-    Simulated asset/gold return.
-
-    Distribution:
-        mean = 8%
-        std dev = 7%
-
-    Bounds:
-        -5.43 standard deviations
-        +7.42 standard deviations
-    """
 
     return truncnorm.rvs(
         -5.43,
@@ -201,144 +243,290 @@ def simulated_asset_return():
 
 
 # ============================================================
+# INDIVIDUAL STOCK MODEL
+# ============================================================
+
+def percentile_value(values, percentile):
+
+    values = sorted(values)
+
+    if not values:
+        return 0
+
+    position = (
+        percentile
+        * (len(values) - 1)
+    )
+
+    lower = int(position)
+    upper = min(lower + 1, len(values) - 1)
+
+    fraction = position - lower
+
+    return (
+        values[lower]
+        + (values[upper] - values[lower])
+        * fraction
+    )
+
+
+def simulated_individual_stock_return(
+    historical_returns
+):
+
+    if not historical_returns:
+
+        return 0.0
+
+    # --------------------------------------------------------
+    # If very little historical data exists, use a conservative
+    # normal model around the long-run target.
+    # --------------------------------------------------------
+
+    if len(historical_returns) < 5:
+
+        return random.gauss(
+            STOCK_TARGET_RETURN,
+            0.25
+        )
+
+    # --------------------------------------------------------
+    # Winsorize extreme historical observations.
+    #
+    # This prevents one spectacular or catastrophic historical
+    # year from determining the entire future model.
+    # --------------------------------------------------------
+
+    lower_bound = percentile_value(
+        historical_returns,
+        STOCK_LOWER_PERCENTILE
+    )
+
+    upper_bound = percentile_value(
+        historical_returns,
+        STOCK_UPPER_PERCENTILE
+    )
+
+    winsorized = [
+        min(
+            max(value, lower_bound),
+            upper_bound
+        )
+        for value in historical_returns
+    ]
+
+    historical_mean = statistics.mean(
+        winsorized
+    )
+
+    historical_std = statistics.stdev(
+        winsorized
+    )
+
+    # --------------------------------------------------------
+    # Shrink historical mean toward a more conservative
+    # long-run equity expectation.
+    # --------------------------------------------------------
+
+    adjusted_mean = (
+        historical_mean
+        * (1 - STOCK_MEAN_SHRINKAGE)
+        + STOCK_TARGET_RETURN
+        * STOCK_MEAN_SHRINKAGE
+    )
+
+    # --------------------------------------------------------
+    # Student-t distribution.
+    #
+    # scipy's t distribution has variance:
+    #
+    #     df / (df - 2) * scale^2
+    #
+    # So this scale adjustment approximately preserves the
+    # historical standard deviation while adding fat tails.
+    # --------------------------------------------------------
+
+    scale = (
+        historical_std
+        * ((STOCK_T_DF - 2) / STOCK_T_DF) ** 0.5
+    )
+
+    if scale <= 0:
+
+        return adjusted_mean
+
+    simulated_return = t.rvs(
+        df=STOCK_T_DF,
+        loc=adjusted_mean,
+        scale=scale
+    )
+
+    return max(
+        simulated_return,
+        -1.0
+    )
+
+
+# ============================================================
 # PORTFOLIO RETURN
 # ============================================================
 
-def calculate_return(annual_returns, ticker_list, stocks, bonds, assets, show_breakdown=False ):
-    """
-    Calculates one year's portfolio return.
-
-    ALL RETURNS ARE DECIMALS.
-
-    Example:
-        0.10 = +10%
-       -0.05 = -5%
-    """
+def calculate_return(
+    annual_returns,
+    ticker_list,
+    stocks,
+    bonds,
+    reits,
+    assets,
+    show_breakdown=False
+):
 
     individual_stock_return = 0
 
-    # --------------------------------------------------------
-    # Individual stocks
-    # --------------------------------------------------------
-
     for i in range(len(ticker_list)):
 
-        if not annual_returns[i]:
-            continue
-
-        average_return = statistics.mean(annual_returns[i])
-
-        if len(annual_returns[i]) >= 2:
-            standard_deviation = statistics.stdev(
+        simulated_return = (
+            simulated_individual_stock_return(
                 annual_returns[i]
             )
-        else:
-            standard_deviation = 0
-
-        simulated_return = random.gauss(
-            average_return,
-            standard_deviation
         )
 
-        # A stock cannot lose more than 100%.
-        simulated_return = max(simulated_return, -1.0)
-
-        # ticker_list weight is already a fraction of
-        # the total portfolio, so DO NOT divide by
-        # number of stocks.
-        individual_stock_return += (simulated_return * ticker_list[i][1])
-
-    # --------------------------------------------------------
-    # S&P 500
-    # --------------------------------------------------------
+        individual_stock_return += (
+            simulated_return
+            * ticker_list[i][1]
+        )
 
     sp_return = simulated_sp_return()
 
-    sp_contribution = stocks * sp_return
+    sp_contribution = (
+        stocks * sp_return
+    )
 
-    # --------------------------------------------------------
-    # Bonds
-    # --------------------------------------------------------
+    bond_return = simulated_tbill_return()
 
-    bond_return = 0.045
+    bond_contribution = (
+        bonds * bond_return
+    )
 
-    bond_contribution = bonds * bond_return
+    reit_return = simulated_reit_return()
 
-    # --------------------------------------------------------
-    # Other assets
-    # --------------------------------------------------------
+    reit_contribution = (
+        reits * reit_return
+    )
 
     asset_return = simulated_asset_return()
 
-    asset_contribution = assets * asset_return
-
-    # --------------------------------------------------------
-    # Total
-    # --------------------------------------------------------
+    asset_contribution = (
+        assets * asset_return
+    )
 
     total_return = (
-            individual_stock_return
-            + sp_contribution
-            + bond_contribution
-            + asset_contribution
+        individual_stock_return
+        + sp_contribution
+        + bond_contribution
+        + reit_contribution
+        + asset_contribution
     )
 
     if show_breakdown:
+
         print("\n--- RETURN BREAKDOWN ---")
+
         print(
-            f"Individual stocks: {individual_stock_return * 100:.2f}%"
+            f"Individual stocks: "
+            f"{individual_stock_return * 100:.2f}%"
         )
+
         print(
-            f"S&P 500:           {sp_contribution * 100:.2f}%"
+            f"S&P 500:           "
+            f"{sp_contribution * 100:.2f}%"
         )
+
         print(
-            f"Bonds:              {bond_contribution * 100:.2f}%"
+            f"T-bills:            "
+            f"{bond_contribution * 100:.2f}%"
         )
+
         print(
-            f"Other assets:       {asset_contribution * 100:.2f}%"
+            f"REITs:              "
+            f"{reit_contribution * 100:.2f}%"
         )
+
         print(
-            f"TOTAL:              {total_return * 100:.2f}%"
+            f"Other assets:       "
+            f"{asset_contribution * 100:.2f}%"
         )
+
+        print(
+            f"TOTAL:              "
+            f"{total_return * 100:.2f}%"
+        )
+
         print("------------------------\n")
 
     return total_return
 
 
 # ============================================================
-# VALIDATE ALLOCATIONS
+# ALLOCATION CHECK
 # ============================================================
 
-def check_allocation(stocks, bonds, assets, ticker_list):
-    stock_weight = sum(weight for _, weight in ticker_list)
+def check_allocation(
+    stocks,
+    bonds,
+    reits,
+    assets,
+    ticker_list
+):
+
+    stock_weight = sum(
+        weight
+        for _, weight in ticker_list
+    )
 
     total = (
-            stocks
-            + bonds
-            + assets
-            + stock_weight
+        stocks
+        + bonds
+        + reits
+        + assets
+        + stock_weight
     )
 
     print("\n--- ALLOCATION CHECK ---")
+
     print(f"S&P 500:       {stocks:.2%}")
-    print(f"Bonds:         {bonds:.2%}")
+    print(f"T-bills:       {bonds:.2%}")
+    print(f"REITs:         {reits:.2%}")
     print(f"Other assets:  {assets:.2%}")
     print(f"Individual:    {stock_weight:.2%}")
     print(f"TOTAL:         {total:.2%}")
+
     print("------------------------")
 
     if abs(total - 1.0) > 0.001:
-        print("WARNING: Portfolio allocation does NOT equal 100%.")
+
+        print(
+            "WARNING: Portfolio allocation "
+            "does NOT equal 100%."
+        )
 
 
 # ============================================================
 # GET DATA
 # ============================================================
 
-print("Be patient. Getting ur data takes time...")
+print(
+    "Be patient. Getting ur data takes time..."
+)
 
-initial_annual_returns = stock_data(INITIAL_STOCKS_LIST)
-later_annual_returns = stock_data(LATER_STOCKS_LIST)
+initial_annual_returns = stock_data(
+    INITIAL_STOCKS_LIST
+)
+
+later_annual_returns = stock_data(
+    LATER_STOCKS_LIST
+)
+
 
 # ============================================================
 # CHECK ALLOCATIONS
@@ -347,6 +535,7 @@ later_annual_returns = stock_data(LATER_STOCKS_LIST)
 check_allocation(
     INITIAL_PERCENT_S_AND_P,
     INITIAL_PERCENT_BONDS,
+    INITIAL_PERCENT_REITS,
     INITIAL_PERCENT_ASSETS,
     INITIAL_STOCKS_LIST
 )
@@ -354,12 +543,14 @@ check_allocation(
 check_allocation(
     LATER_PERCENT_S_AND_P,
     LATER_PERCENT_BONDS,
+    LATER_PERCENT_REITS,
     LATER_PERCENT_ASSETS,
     LATER_STOCKS_LIST
 )
 
+
 # ============================================================
-# MONTE CARLO SIMULATION
+# MONTE CARLO SETTINGS
 # ============================================================
 
 NUM_SIMULATIONS = 10000
@@ -367,52 +558,33 @@ NUM_SIMULATIONS = 10000
 num_worked = 0
 num_times = 0
 
-# ------------------------------------------------------------
-# FAILURE TRACKING
-# ------------------------------------------------------------
-
 failure_count_by_year = defaultdict(int)
 
-# ------------------------------------------------------------
-# YEARLY PORTFOLIO VALUE TRACKING
-# ------------------------------------------------------------
-
-tracked_years = [2027, 2028, 2029, 2030, 2031, 2032, 2033, 2034, 2035, 2036, 2037, 2038, 2039, 2040, 2041, 2042]
+tracked_years = [
+    2027, 2028, 2029, 2030,
+    2031, 2032, 2033, 2034,
+    2035, 2036, 2037, 2038,
+    2039, 2040, 2041, 2042
+]
 
 year_value_totals = {
     year: 0.0
     for year in tracked_years
 }
 
-# ------------------------------------------------------------
-# FINAL PORTFOLIO VALUES
-# ------------------------------------------------------------
-#
-# final_values contains EVERY simulation's final value.
-#
-# successful_final_values contains only simulations that
-# successfully made it through 2042.
-# ------------------------------------------------------------
-
 final_values = []
 successful_final_values = []
 
 
 # ============================================================
-# RUN SIMULATIONS
+# RUN MONTE CARLO
 # ============================================================
 
 for simulation in range(NUM_SIMULATIONS):
 
-    # --------------------------------------------------------
-    # RESET SIMULATION
-    # --------------------------------------------------------
-
     portfolio_value = 300000
-    current_year = 2027
     success = True
 
-    # Every simulation gets exactly one value for every year.
     simulation_values = {
         year: 0.0
         for year in tracked_years
@@ -427,10 +599,15 @@ for simulation in range(NUM_SIMULATIONS):
         INITIAL_STOCKS_LIST,
         INITIAL_PERCENT_S_AND_P,
         INITIAL_PERCENT_BONDS,
+        INITIAL_PERCENT_REITS,
         INITIAL_PERCENT_ASSETS
     )
 
-    portfolio_value = portfolio_value * (1 + annual_return)
+    portfolio_value *= (
+        1 + annual_return
+    )
+
+    portfolio_value += INITIAL_CONTRIBUTION
 
     simulation_values[2027] = portfolio_value
 
@@ -439,24 +616,33 @@ for simulation in range(NUM_SIMULATIONS):
     # --------------------------------------------------------
 
     current_year = 2028
-    portfolio_value += 150000  # Second contribution
 
     for j in range(5):
+
         annual_return = calculate_return(
             initial_annual_returns,
             INITIAL_STOCKS_LIST,
             INITIAL_PERCENT_S_AND_P,
             INITIAL_PERCENT_BONDS,
+            INITIAL_PERCENT_REITS,
             INITIAL_PERCENT_ASSETS
         )
 
-        portfolio_value *= (1 + annual_return)
+        portfolio_value *= (
+            1 + annual_return
+        )
 
-        simulation_values[current_year] = portfolio_value
+        simulation_values[current_year] = (
+            portfolio_value
+        )
 
         current_year += 1
 
-    portfolio_value -= VARIABLE_CONTRIBUTION
+    # --------------------------------------------------------
+    # Variable withdrawal
+    # --------------------------------------------------------
+
+    portfolio_value -= VARIABLE_WITHDRAWAL
 
     if portfolio_value <= 0:
 
@@ -480,8 +666,7 @@ for simulation in range(NUM_SIMULATIONS):
 
         for j in range(10):
 
-            # Beginning-of-year withdrawal
-            portfolio_value -= 50000
+            portfolio_value -= ANNUAL_WITHDRAWAL
 
             if portfolio_value <= 0:
 
@@ -497,16 +682,18 @@ for simulation in range(NUM_SIMULATIONS):
 
                 break
 
-            # Investment return
             annual_return = calculate_return(
                 later_annual_returns,
                 LATER_STOCKS_LIST,
                 LATER_PERCENT_S_AND_P,
                 LATER_PERCENT_BONDS,
+                LATER_PERCENT_REITS,
                 LATER_PERCENT_ASSETS
             )
 
-            portfolio_value *= (1 + annual_return)
+            portfolio_value *= (
+                1 + annual_return
+            )
 
             if portfolio_value <= 0:
 
@@ -516,136 +703,239 @@ for simulation in range(NUM_SIMULATIONS):
                 failure_count_by_year[current_year] += 1
 
                 for year in tracked_years:
+
                     if year >= current_year:
                         simulation_values[year] = 0.0
+
                 break
 
-            # Record end-of-year value
-            simulation_values[current_year] = portfolio_value
+            simulation_values[current_year] = (
+                portfolio_value
+            )
 
             current_year += 1
 
     # --------------------------------------------------------
-    # ADD THIS SIMULATION TO YEARLY TOTALS
+    # Yearly totals
     # --------------------------------------------------------
 
     for year in tracked_years:
-        year_value_totals[year] += simulation_values[year]
+
+        year_value_totals[year] += (
+            simulation_values[year]
+        )
 
     # --------------------------------------------------------
-    # RECORD FINAL VALUE
+    # Final values
     # --------------------------------------------------------
 
     final_value = simulation_values[2042]
 
     final_values.append(final_value)
 
-    # Only successful simulations go into this list
     if success:
-        successful_final_values.append(final_value)
+
+        successful_final_values.append(
+            final_value
+        )
+
         num_worked += 1
 
     num_times += 1
 
-    # ========================================================
-    # CALCULATE LIVE STATISTICS
-    # ========================================================
-
-    success_rate = (num_worked / num_times) * 100
-
     # --------------------------------------------------------
-    # Average final value
+    # Statistics
     # --------------------------------------------------------
 
-    average_final = statistics.mean(final_values)
+    success_rate = (
+        num_worked
+        / num_times
+        * 100
+    )
 
-    # --------------------------------------------------------
-    # Median final value
-    # --------------------------------------------------------
+    average_final = statistics.mean(
+        final_values
+    )
 
-    median_final = statistics.median(final_values)
+    median_final = statistics.median(
+        final_values
+    )
 
-    # --------------------------------------------------------
-    # Percentiles
-    # --------------------------------------------------------
+    sorted_values = sorted(
+        final_values
+    )
 
-    sorted_values = sorted(final_values)
-    p10 = sorted_values[int(len(sorted_values) * 0.10)]
-    p25 = sorted_values[int(len(sorted_values) * 0.25)]
-    p75 = sorted_values[int(len(sorted_values) * 0.75)]
-    p90 = sorted_values[int(len(sorted_values) * 0.90)]
+    p10 = sorted_values[
+        int(len(sorted_values) * 0.10)
+    ]
 
-    maximum_final = max(final_values)
+    p25 = sorted_values[
+        int(len(sorted_values) * 0.25)
+    ]
 
-    # Average among successful simulations
+    p75 = sorted_values[
+        int(len(sorted_values) * 0.75)
+    ]
+
+    p90 = sorted_values[
+        int(len(sorted_values) * 0.90)
+    ]
+
+    maximum_final = max(
+        final_values
+    )
+
     if successful_final_values:
-        average_successful = statistics.mean(successful_final_values)
+
+        average_successful = (
+            statistics.mean(
+                successful_final_values
+            )
+        )
+
     else:
+
         average_successful = 0
 
-    # ========================================================
-    # LIVE DASHBOARD
-    # ========================================================
+    # --------------------------------------------------------
+    # Dashboard
+    # --------------------------------------------------------
 
     dashboard = []
-    dashboard.append("=" * 70)
-    dashboard.append(f"SIMULATION: "f"{num_times:,}/{NUM_SIMULATIONS:,}")
-    dashboard.append(f"SUCCESS RATE: "f"{success_rate:.2f}%")
+
+    dashboard.append(
+        "=" * 70
+    )
+
+    dashboard.append(
+        f"SIMULATION: "
+        f"{num_times:,}/{NUM_SIMULATIONS:,}"
+    )
+
+    dashboard.append(
+        f"SUCCESS RATE: "
+        f"{success_rate:.2f}%"
+    )
+
     dashboard.append("")
-    dashboard.append("2042 PORTFOLIO STATISTICS")
-    dashboard.append("-" * 70)
-    dashboard.append(f"Average (all):       "f"${average_final:,.0f}")
-    dashboard.append(f"Average (successful):"f" ${average_successful:,.0f}")
-    dashboard.append(f"Median:              "f"${median_final:,.0f}")
-    dashboard.append(f"10th percentile:     "f"${p10:,.0f}")
-    dashboard.append(f"25th percentile:     " f"${p25:,.0f}")
-    dashboard.append(f"75th percentile:     " f"${p75:,.0f}")
-    dashboard.append(f"90th percentile:     "f"${p90:,.0f}" )
-    dashboard.append(f"Maximum:             "f"${maximum_final:,.0f}")
+
+    dashboard.append(
+        "2042 PORTFOLIO STATISTICS"
+    )
+
+    dashboard.append(
+        "-" * 70
+    )
+
+    dashboard.append(
+        f"Average (all):       "
+        f"${average_final:,.0f}"
+    )
+
+    dashboard.append(
+        f"Average (successful):"
+        f" ${average_successful:,.0f}"
+    )
+
+    dashboard.append(
+        f"Median:              "
+        f"${median_final:,.0f}"
+    )
+
+    dashboard.append(
+        f"10th percentile:     "
+        f"${p10:,.0f}"
+    )
+
+    dashboard.append(
+        f"25th percentile:     "
+        f"${p25:,.0f}"
+    )
+
+    dashboard.append(
+        f"75th percentile:     "
+        f"${p75:,.0f}"
+    )
+
+    dashboard.append(
+        f"90th percentile:     "
+        f"${p90:,.0f}"
+    )
+
+    dashboard.append(
+        f"Maximum:             "
+        f"${maximum_final:,.0f}"
+    )
+
     dashboard.append("")
-    dashboard.append("AVERAGE PORTFOLIO VALUE BY YEAR")
-    dashboard.append("-" * 70)
+
+    dashboard.append(
+        "AVERAGE PORTFOLIO VALUE BY YEAR"
+    )
+
+    dashboard.append(
+        "-" * 70
+    )
 
     for year in tracked_years:
 
-        average_value = (year_value_totals[year] / num_times)
+        average_value = (
+            year_value_totals[year]
+            / num_times
+        )
 
-        dashboard.append(f"{year}: ${average_value:,.0f}")
+        dashboard.append(
+            f"{year}: ${average_value:,.0f}"
+        )
 
     dashboard.append("")
-    dashboard.append("FAILURES BY YEAR")
-    dashboard.append("-" * 70)
+
+    dashboard.append(
+        "FAILURES BY YEAR"
+    )
+
+    dashboard.append(
+        "-" * 70
+    )
 
     if failure_count_by_year:
 
-        for year in sorted(failure_count_by_year):
+        for year in sorted(
+            failure_count_by_year
+        ):
 
-            count = failure_count_by_year[year]
-            percentage = (count / num_times) * 100
-            dashboard.append(f"{year}: "f"{count:,} "f"({percentage:.2f}%)")
+            count = failure_count_by_year[
+                year
+            ]
+
+            percentage = (
+                count
+                / num_times
+                * 100
+            )
+
+            dashboard.append(
+                f"{year}: "
+                f"{count:,} "
+                f"({percentage:.2f}%)"
+            )
 
     else:
-        dashboard.append("No failures yet.")
 
-    dashboard.append("=" * 70)
+        dashboard.append(
+            "No failures yet."
+        )
 
-    # --------------------------------------------------------
-    # LIVE OUTPUT
-    # --------------------------------------------------------
-    #
-    # \r returns to the beginning of the current line.
-    #
-    # Because some consoles don't support ANSI escape codes,
-    # we keep the dashboard on one physical line.
-    # --------------------------------------------------------
-
-    one_line_dashboard = " | ".join(dashboard)
-
-    sys.stdout.write(
-        "\r" + one_line_dashboard + " " * 50
+    dashboard.append(
+        "=" * 70
     )
 
-    sys.stdout.flush()
+    print(
+        "\r"
+        + " | ".join(dashboard),
+        end="",
+        flush=True
+    )
 
 
 # ============================================================
@@ -654,20 +944,39 @@ for simulation in range(NUM_SIMULATIONS):
 
 print()
 print()
+
 print("=" * 70)
 print("FINAL MONTE CARLO RESULTS")
 print("=" * 70)
 
-success_rate = (num_worked / num_times) * 100
+success_rate = (
+    num_worked
+    / num_times
+    * 100
+)
 
-print(f"Simulations:       {num_times:,}")
-print(f"Successful:        {num_worked:,}")
-print(f"Failed:            "f"{num_times - num_worked:,}")
-print(f"Success Rate:      "f"{success_rate:.2f}%")
+print(
+    f"Simulations:       {num_times:,}"
+)
 
-# ------------------------------------------------------------
+print(
+    f"Successful:        {num_worked:,}"
+)
+
+print(
+    f"Failed:            "
+    f"{num_times - num_worked:,}"
+)
+
+print(
+    f"Success Rate:      "
+    f"{success_rate:.2f}%"
+)
+
+
+# ============================================================
 # 2042 STATISTICS
-# ------------------------------------------------------------
+# ============================================================
 
 print()
 print("=" * 70)
@@ -682,28 +991,81 @@ median_final = statistics.median(
     final_values
 )
 
-sorted_values = sorted(final_values)
+sorted_values = sorted(
+    final_values
+)
 
-p10 = sorted_values[int(len(sorted_values) * 0.10)]
-p25 = sorted_values[int(len(sorted_values) * 0.25)]
-p75 = sorted_values[int(len(sorted_values) * 0.75)]
-p90 = sorted_values[int(len(sorted_values) * 0.90)]
+p10 = sorted_values[
+    int(len(sorted_values) * 0.10)
+]
 
-maximum_final = max(final_values)
+p25 = sorted_values[
+    int(len(sorted_values) * 0.25)
+]
+
+p75 = sorted_values[
+    int(len(sorted_values) * 0.75)
+]
+
+p90 = sorted_values[
+    int(len(sorted_values) * 0.90)
+]
+
+maximum_final = max(
+    final_values
+)
 
 if successful_final_values:
-    average_successful = statistics.mean(successful_final_values)
+
+    average_successful = statistics.mean(
+        successful_final_values
+    )
+
 else:
+
     average_successful = 0
 
-print(f"Average (all):        "f"${average_final:,.2f}")
-print(f"Average (successful): "f"${average_successful:,.2f}")
-print(f"Median:               "f"${median_final:,.2f}")
-print(f"10th percentile:      "f"${p10:,.2f}")
-print(f"25th percentile:      "f"${p25:,.2f}")
-print(f"75th percentile:      "f"${p75:,.2f}")
-print(f"90th percentile:      "f"${p90:,.2f}")
-print( f"Maximum:              "f"${maximum_final:,.2f}")
+
+print(
+    f"Average (all):        "
+    f"${average_final:,.2f}"
+)
+
+print(
+    f"Average (successful): "
+    f"${average_successful:,.2f}"
+)
+
+print(
+    f"Median:               "
+    f"${median_final:,.2f}"
+)
+
+print(
+    f"10th percentile:      "
+    f"${p10:,.2f}"
+)
+
+print(
+    f"25th percentile:      "
+    f"${p25:,.2f}"
+)
+
+print(
+    f"75th percentile:      "
+    f"${p75:,.2f}"
+)
+
+print(
+    f"90th percentile:      "
+    f"${p90:,.2f}"
+)
+
+print(
+    f"Maximum:              "
+    f"${maximum_final:,.2f}"
+)
+
 
 # ============================================================
 # FAILURE YEARS
@@ -716,13 +1078,28 @@ print("=" * 70)
 
 if failure_count_by_year:
 
-    for year in sorted(failure_count_by_year):
+    for year in sorted(
+        failure_count_by_year
+    ):
 
-        count = failure_count_by_year[year]
-        percentage = (count / num_times) * 100
-        print(f"{year}: " f"{count:,} failures "f"({percentage:.2f}%)")
+        count = failure_count_by_year[
+            year
+        ]
+
+        percentage = (
+            count
+            / num_times
+            * 100
+        )
+
+        print(
+            f"{year}: "
+            f"{count:,} failures "
+            f"({percentage:.2f}%)"
+        )
 
 else:
+
     print("No failures.")
 
 
@@ -737,8 +1114,14 @@ print("=" * 70)
 
 for year in tracked_years:
 
-    average_value = (year_value_totals[year] / num_times)
+    average_value = (
+        year_value_totals[year]
+        / num_times
+    )
 
-    print(f"{year}: ${average_value:,.2f}")
+    print(
+        f"{year}: "
+        f"${average_value:,.2f}"
+    )
 
 print("=" * 70)
