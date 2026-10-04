@@ -10,15 +10,17 @@ from collections import defaultdict
 # ============================================================
 
 INITIAL_PERCENT_S_AND_P = 0.64
-INITIAL_PERCENT_BONDS = 0.36
-INITIAL_PERCENT_ASSETS = 0.0
+INITIAL_PERCENT_BONDS = 0.34
+INITIAL_PERCENT_ASSETS = 0.02
 
-LATER_PERCENT_S_AND_P = 0.4
-LATER_PERCENT_BONDS = 0.6
+LATER_PERCENT_S_AND_P = 0.45
+LATER_PERCENT_BONDS = 0.55
 LATER_PERCENT_ASSETS = 0.0
 
 INITIAL_STOCKS_LIST = []
 LATER_STOCKS_LIST = []
+
+VARIABLE_CONTRIBUTION = 200000
 
 
 # Example:
@@ -120,9 +122,7 @@ def stock_data(ticker_list):
             # a true calendar-year return without the previous
             # year's closing price.
             if previous_year_end is not None and previous_year_end > 0:
-                annual_return = (
-                                        end_price / previous_year_end
-                                ) - 1
+                annual_return = (end_price / previous_year_end) - 1
 
                 temp_stock_returns.append(annual_return)
 
@@ -204,14 +204,7 @@ def simulated_asset_return():
 # PORTFOLIO RETURN
 # ============================================================
 
-def calculate_return(
-        annual_returns,
-        ticker_list,
-        stocks,
-        bonds,
-        assets,
-        show_breakdown=False
-):
+def calculate_return(annual_returns, ticker_list, stocks, bonds, assets, show_breakdown=False ):
     """
     Calculates one year's portfolio return.
 
@@ -253,9 +246,7 @@ def calculate_return(
         # ticker_list weight is already a fraction of
         # the total portfolio, so DO NOT divide by
         # number of stocks.
-        individual_stock_return += (
-                simulated_return * ticker_list[i][1]
-        )
+        individual_stock_return += (simulated_return * ticker_list[i][1])
 
     # --------------------------------------------------------
     # S&P 500
@@ -386,24 +377,7 @@ failure_count_by_year = defaultdict(int)
 # YEARLY PORTFOLIO VALUE TRACKING
 # ------------------------------------------------------------
 
-tracked_years = [
-    2027,
-    2028,
-    2029,
-    2030,
-    2031,
-    2032,
-    2033,
-    2034,
-    2035,
-    2036,
-    2037,
-    2038,
-    2039,
-    2040,
-    2041,
-    2042
-]
+tracked_years = [2027, 2028, 2029, 2030, 2031, 2032, 2033, 2034, 2035, 2036, 2037, 2038, 2039, 2040, 2041, 2042]
 
 year_value_totals = {
     year: 0.0
@@ -456,10 +430,7 @@ for simulation in range(NUM_SIMULATIONS):
         INITIAL_PERCENT_ASSETS
     )
 
-    portfolio_value = (
-        portfolio_value * (1 + annual_return)
-        + 150000
-    )
+    portfolio_value = portfolio_value * (1 + annual_return)
 
     simulation_values[2027] = portfolio_value
 
@@ -468,9 +439,9 @@ for simulation in range(NUM_SIMULATIONS):
     # --------------------------------------------------------
 
     current_year = 2028
+    portfolio_value += 150000  # Second contribution
 
-    for j in range(4):
-
+    for j in range(5):
         annual_return = calculate_return(
             initial_annual_returns,
             INITIAL_STOCKS_LIST,
@@ -485,11 +456,7 @@ for simulation in range(NUM_SIMULATIONS):
 
         current_year += 1
 
-    # --------------------------------------------------------
-    # $150,000 WITHDRAWAL
-    # --------------------------------------------------------
-
-    portfolio_value -= 200000
+    portfolio_value -= VARIABLE_CONTRIBUTION
 
     if portfolio_value <= 0:
 
@@ -549,10 +516,8 @@ for simulation in range(NUM_SIMULATIONS):
                 failure_count_by_year[current_year] += 1
 
                 for year in tracked_years:
-
                     if year >= current_year:
                         simulation_values[year] = 0.0
-
                 break
 
             # Record end-of-year value
@@ -565,7 +530,6 @@ for simulation in range(NUM_SIMULATIONS):
     # --------------------------------------------------------
 
     for year in tracked_years:
-
         year_value_totals[year] += simulation_values[year]
 
     # --------------------------------------------------------
@@ -578,7 +542,6 @@ for simulation in range(NUM_SIMULATIONS):
 
     # Only successful simulations go into this list
     if success:
-
         successful_final_values.append(final_value)
         num_worked += 1
 
@@ -588,59 +551,36 @@ for simulation in range(NUM_SIMULATIONS):
     # CALCULATE LIVE STATISTICS
     # ========================================================
 
-    success_rate = (
-        num_worked / num_times
-    ) * 100
+    success_rate = (num_worked / num_times) * 100
 
     # --------------------------------------------------------
     # Average final value
     # --------------------------------------------------------
 
-    average_final = statistics.mean(
-        final_values
-    )
+    average_final = statistics.mean(final_values)
 
     # --------------------------------------------------------
     # Median final value
     # --------------------------------------------------------
 
-    median_final = statistics.median(
-        final_values
-    )
+    median_final = statistics.median(final_values)
 
     # --------------------------------------------------------
     # Percentiles
     # --------------------------------------------------------
 
     sorted_values = sorted(final_values)
-
-    p10 = sorted_values[
-        int(len(sorted_values) * 0.10)
-    ]
-
-    p25 = sorted_values[
-        int(len(sorted_values) * 0.25)
-    ]
-
-    p75 = sorted_values[
-        int(len(sorted_values) * 0.75)
-    ]
-
-    p90 = sorted_values[
-        int(len(sorted_values) * 0.90)
-    ]
+    p10 = sorted_values[int(len(sorted_values) * 0.10)]
+    p25 = sorted_values[int(len(sorted_values) * 0.25)]
+    p75 = sorted_values[int(len(sorted_values) * 0.75)]
+    p90 = sorted_values[int(len(sorted_values) * 0.90)]
 
     maximum_final = max(final_values)
 
     # Average among successful simulations
     if successful_final_values:
-
-        average_successful = statistics.mean(
-            successful_final_values
-        )
-
+        average_successful = statistics.mean(successful_final_values)
     else:
-
         average_successful = 0
 
     # ========================================================
@@ -648,92 +588,32 @@ for simulation in range(NUM_SIMULATIONS):
     # ========================================================
 
     dashboard = []
-
     dashboard.append("=" * 70)
-
-    dashboard.append(
-        f"SIMULATION: "
-        f"{num_times:,}/{NUM_SIMULATIONS:,}"
-    )
-
-    dashboard.append(
-        f"SUCCESS RATE: "
-        f"{success_rate:.2f}%"
-    )
-
+    dashboard.append(f"SIMULATION: "f"{num_times:,}/{NUM_SIMULATIONS:,}")
+    dashboard.append(f"SUCCESS RATE: "f"{success_rate:.2f}%")
     dashboard.append("")
-
-    dashboard.append(
-        "2042 PORTFOLIO STATISTICS"
-    )
-
+    dashboard.append("2042 PORTFOLIO STATISTICS")
     dashboard.append("-" * 70)
-
-    dashboard.append(
-        f"Average (all):       "
-        f"${average_final:,.0f}"
-    )
-
-    dashboard.append(
-        f"Average (successful):"
-        f" ${average_successful:,.0f}"
-    )
-
-    dashboard.append(
-        f"Median:              "
-        f"${median_final:,.0f}"
-    )
-
-    dashboard.append(
-        f"10th percentile:     "
-        f"${p10:,.0f}"
-    )
-
-    dashboard.append(
-        f"25th percentile:     "
-        f"${p25:,.0f}"
-    )
-
-    dashboard.append(
-        f"75th percentile:     "
-        f"${p75:,.0f}"
-    )
-
-    dashboard.append(
-        f"90th percentile:     "
-        f"${p90:,.0f}"
-    )
-
-    dashboard.append(
-        f"Maximum:             "
-        f"${maximum_final:,.0f}"
-    )
-
+    dashboard.append(f"Average (all):       "f"${average_final:,.0f}")
+    dashboard.append(f"Average (successful):"f" ${average_successful:,.0f}")
+    dashboard.append(f"Median:              "f"${median_final:,.0f}")
+    dashboard.append(f"10th percentile:     "f"${p10:,.0f}")
+    dashboard.append(f"25th percentile:     " f"${p25:,.0f}")
+    dashboard.append(f"75th percentile:     " f"${p75:,.0f}")
+    dashboard.append(f"90th percentile:     "f"${p90:,.0f}" )
+    dashboard.append(f"Maximum:             "f"${maximum_final:,.0f}")
     dashboard.append("")
-
-    dashboard.append(
-        "AVERAGE PORTFOLIO VALUE BY YEAR"
-    )
-
+    dashboard.append("AVERAGE PORTFOLIO VALUE BY YEAR")
     dashboard.append("-" * 70)
 
     for year in tracked_years:
 
-        average_value = (
-            year_value_totals[year]
-            / num_times
-        )
+        average_value = (year_value_totals[year] / num_times)
 
-        dashboard.append(
-            f"{year}: ${average_value:,.0f}"
-        )
+        dashboard.append(f"{year}: ${average_value:,.0f}")
 
     dashboard.append("")
-
-    dashboard.append(
-        "FAILURES BY YEAR"
-    )
-
+    dashboard.append("FAILURES BY YEAR")
     dashboard.append("-" * 70)
 
     if failure_count_by_year:
@@ -741,22 +621,11 @@ for simulation in range(NUM_SIMULATIONS):
         for year in sorted(failure_count_by_year):
 
             count = failure_count_by_year[year]
-
-            percentage = (
-                count / num_times
-            ) * 100
-
-            dashboard.append(
-                f"{year}: "
-                f"{count:,} "
-                f"({percentage:.2f}%)"
-            )
+            percentage = (count / num_times) * 100
+            dashboard.append(f"{year}: "f"{count:,} "f"({percentage:.2f}%)")
 
     else:
-
-        dashboard.append(
-            "No failures yet."
-        )
+        dashboard.append("No failures yet.")
 
     dashboard.append("=" * 70)
 
@@ -789,27 +658,12 @@ print("=" * 70)
 print("FINAL MONTE CARLO RESULTS")
 print("=" * 70)
 
-success_rate = (
-    num_worked / num_times
-) * 100
+success_rate = (num_worked / num_times) * 100
 
-print(
-    f"Simulations:       {num_times:,}"
-)
-
-print(
-    f"Successful:        {num_worked:,}"
-)
-
-print(
-    f"Failed:            "
-    f"{num_times - num_worked:,}"
-)
-
-print(
-    f"Success Rate:      "
-    f"{success_rate:.2f}%"
-)
+print(f"Simulations:       {num_times:,}")
+print(f"Successful:        {num_worked:,}")
+print(f"Failed:            "f"{num_times - num_worked:,}")
+print(f"Success Rate:      "f"{success_rate:.2f}%")
 
 # ------------------------------------------------------------
 # 2042 STATISTICS
@@ -830,74 +684,26 @@ median_final = statistics.median(
 
 sorted_values = sorted(final_values)
 
-p10 = sorted_values[
-    int(len(sorted_values) * 0.10)
-]
-
-p25 = sorted_values[
-    int(len(sorted_values) * 0.25)
-]
-
-p75 = sorted_values[
-    int(len(sorted_values) * 0.75)
-]
-
-p90 = sorted_values[
-    int(len(sorted_values) * 0.90)
-]
+p10 = sorted_values[int(len(sorted_values) * 0.10)]
+p25 = sorted_values[int(len(sorted_values) * 0.25)]
+p75 = sorted_values[int(len(sorted_values) * 0.75)]
+p90 = sorted_values[int(len(sorted_values) * 0.90)]
 
 maximum_final = max(final_values)
 
 if successful_final_values:
-
-    average_successful = statistics.mean(
-        successful_final_values
-    )
-
+    average_successful = statistics.mean(successful_final_values)
 else:
-
     average_successful = 0
 
-print(
-    f"Average (all):        "
-    f"${average_final:,.2f}"
-)
-
-print(
-    f"Average (successful): "
-    f"${average_successful:,.2f}"
-)
-
-print(
-    f"Median:               "
-    f"${median_final:,.2f}"
-)
-
-print(
-    f"10th percentile:      "
-    f"${p10:,.2f}"
-)
-
-print(
-    f"25th percentile:      "
-    f"${p25:,.2f}"
-)
-
-print(
-    f"75th percentile:      "
-    f"${p75:,.2f}"
-)
-
-print(
-    f"90th percentile:      "
-    f"${p90:,.2f}"
-)
-
-print(
-    f"Maximum:              "
-    f"${maximum_final:,.2f}"
-)
-
+print(f"Average (all):        "f"${average_final:,.2f}")
+print(f"Average (successful): "f"${average_successful:,.2f}")
+print(f"Median:               "f"${median_final:,.2f}")
+print(f"10th percentile:      "f"${p10:,.2f}")
+print(f"25th percentile:      "f"${p25:,.2f}")
+print(f"75th percentile:      "f"${p75:,.2f}")
+print(f"90th percentile:      "f"${p90:,.2f}")
+print( f"Maximum:              "f"${maximum_final:,.2f}")
 
 # ============================================================
 # FAILURE YEARS
@@ -913,19 +719,10 @@ if failure_count_by_year:
     for year in sorted(failure_count_by_year):
 
         count = failure_count_by_year[year]
-
-        percentage = (
-            count / num_times
-        ) * 100
-
-        print(
-            f"{year}: "
-            f"{count:,} failures "
-            f"({percentage:.2f}%)"
-        )
+        percentage = (count / num_times) * 100
+        print(f"{year}: " f"{count:,} failures "f"({percentage:.2f}%)")
 
 else:
-
     print("No failures.")
 
 
@@ -940,13 +737,8 @@ print("=" * 70)
 
 for year in tracked_years:
 
-    average_value = (
-        year_value_totals[year]
-        / num_times
-    )
+    average_value = (year_value_totals[year] / num_times)
 
-    print(
-        f"{year}: ${average_value:,.2f}"
-    )
+    print(f"{year}: ${average_value:,.2f}")
 
 print("=" * 70)
