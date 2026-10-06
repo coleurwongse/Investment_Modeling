@@ -1,7 +1,8 @@
-from scipy.stats import truncnorm, t
+from scipy.stats import t
 import usstock
 import statistics
 import random
+import math
 from collections import defaultdict
 
 
@@ -11,12 +12,10 @@ from collections import defaultdict
 
 INITIAL_PERCENT_S_AND_P = 0.64
 INITIAL_PERCENT_BONDS = 0.34
-INITIAL_PERCENT_REITS = 0.0
-INITIAL_PERCENT_ASSETS = 0.02
+INITIAL_PERCENT_ASSETS = 0.0
 
 LATER_PERCENT_S_AND_P = 0.45
 LATER_PERCENT_BONDS = 0.55
-LATER_PERCENT_REITS = 0.0
 LATER_PERCENT_ASSETS = 0.0
 
 INITIAL_STOCKS_LIST = []
@@ -28,7 +27,7 @@ LATER_STOCKS_LIST = []
 # ============================================================
 
 INITIAL_CONTRIBUTION = 150000
-VARIABLE_WITHDRAWAL = 200000
+VARIABLE_WITHDRAWAL = 100000
 ANNUAL_WITHDRAWAL = 50000
 
 
@@ -51,54 +50,102 @@ STOCK_T_DF = 5
 STOCK_LOWER_PERCENTILE = 0.05
 STOCK_UPPER_PERCENTILE = 0.95
 
-# REIT model
-REIT_MEAN = 8.24
-REIT_STD = 19.07
+# ------------------------------------------------------------
+# S&P 500 model
+# ------------------------------------------------------------
+# Returns are generated directly from a Student-t distribution.
+# These are arithmetic annual-return targets.
+SP_MEAN = 0.11
+SP_STD = 0.194
+SP_T_DF = 5
+
+
+# ------------------------------------------------------------
+# Treasury bill / CIR model
+# ------------------------------------------------------------
+# The T-bill rate is modeled as a mean-reverting CIR process:
+#
+#   dr = kappa * (theta - r) * dt
+#        + sigma * sqrt(max(r, 0)) * dW
+#
+# The process stays non-negative and tends toward 4.25%.
+TBILL_INITIAL_RATE = 0.0425
+TBILL_LONG_RUN_RATE = 0.0425
+TBILL_KAPPA = 0.75
+TBILL_SIGMA = 0.12
+
+
+# ------------------------------------------------------------
+# Gold model
+# ------------------------------------------------------------
+# Gold gets a Student-t distribution with substantially heavier
+# tails and higher volatility than the S&P 500.
+GOLD_MEAN = 0.08
+GOLD_STD = 0.25
+GOLD_T_DF = 4
+
+
+# ------------------------------------------------------------
+# Individual-stock model
+# ------------------------------------------------------------
+STOCK_TARGET_RETURN = 0.08
+STOCK_MEAN_SHRINKAGE = 0.50
+STOCK_T_DF = 5
+
+# Fraction of each stock's variance driven by its sector factor.
+# 0.30 means stocks in the same sector have meaningful positive
+# correlation without moving identically.
+STOCK_SECTOR_CORRELATION = 0.30
+
+# If a stock tuple only has (ticker, weight), it uses this sector.
+DEFAULT_STOCK_SECTOR = "Other"
+
+# Optional fallback sector map. Add tickers here if you do not
+# want to put the sector directly into each stock tuple.
+STOCK_SECTORS = {
+    # "AAPL": "Technology",
+    # "MSFT": "Technology",
+    # "NVDA": "Technology",
+    # "JPM": "Financials",
+    # "XOM": "Energy",
+    # "JNJ": "Healthcare",
+}
+
+# Winsorization limits for historical stock returns.
+STOCK_LOWER_PERCENTILE = 0.05
+STOCK_UPPER_PERCENTILE = 0.95
 
 
 # ============================================================
-# HISTORICAL 1-YEAR TREASURY BILL RATES
-# ============================================================
-#
-# Annual average 1-year Treasury Bill rates.
-#
-# Values are percentages.
-#
-# Source: Federal Reserve H.15 / historical series used by
-# Macrotrends.
-#
-# These are used as historical observations from which the
-# simulation randomly selects a year's T-bill return.
+# TREASURY BILL / CIR MODEL
 # ============================================================
 
-TREASURY_BILL_RATES = [
-    4.64, 3.42, 2.81, 3.01, 3.30, 3.75, 4.06, 5.07,
-    4.70, 5.46, 6.79, 6.49, 4.67, 4.76, 7.02, 7.72,
-    6.30, 5.52, 5.70, 7.74, 9.73, 10.85, 13.16, 11.07,
-    8.80, 9.94, 7.81, 6.07, 6.33, 7.13, 7.92, 7.35,
-    5.52, 3.71, 3.29, 5.02, 5.60, 5.22, 5.32, 4.80,
-    4.81, 5.78, 3.84, 1.67,
-
-    # 2003-2007
-    1.05, 1.57, 3.39, 4.81, 4.45,
-
-    # 2008-2025
-    1.63, 0.45, 0.30, 0.17, 0.17, 0.13, 0.11,
-    0.30, 0.60, 1.17, 2.25, 1.99, 0.36, 0.10,
-    2.68, 4.84, 4.48, 3.76
-]
-
-
-def simulated_tbill_return():
+def simulated_tbill_return(current_rate):
     """
-    Randomly selects a historical annual 1-year Treasury
-    Bill rate.
+    Generate the next year's T-bill rate using a Cox-Ingersoll-Ross
+    (CIR) mean-reverting process.
 
-    Returns decimal:
-        0.045 = 4.5%
+    Returns:
+        next_rate: decimal annual T-bill return/rate
     """
 
-    return random.choice(TREASURY_BILL_RATES) / 100
+    dt = 1.0
+    shock = random.gauss(0.0, 1.0)
+
+    next_rate = (
+        current_rate
+        + TBILL_KAPPA
+        * (TBILL_LONG_RUN_RATE - current_rate)
+        * dt
+        + TBILL_SIGMA
+        * math.sqrt(max(current_rate, 0.0))
+        * math.sqrt(dt)
+        * shock
+    )
+
+    # Euler discretization can very occasionally step below zero.
+    # T-bill rates cannot be negative in this model.
+    return max(next_rate, 0.0)
 
 
 # ============================================================
@@ -181,65 +228,44 @@ def stock_data(ticker_list):
 # S&P 500 MODEL
 # ============================================================
 
+def _student_t_scale(std, df):
+    """Convert a desired standard deviation into scipy t scale."""
+    if df <= 2:
+        raise ValueError("Student-t df must be greater than 2.")
+    return std * math.sqrt((df - 2) / df)
+
+
 def simulated_sp_return():
+    """
+    Generate an S&P 500 annual return from a Student-t distribution
+    centered at 11% with a 19.4% standard deviation.
+    """
 
-    historical_returns = [
-        0.4381, -0.0830, -0.2512, -0.4384, -0.0864,
-        0.4959, -0.4770, -0.4284, -0.5309, 0.3655,
-        0.0555, 0.0578, 0.0562, 0.1840, 0.0551,
-        0.1813, 0.3169, 0.1048, 0.1276, 0.0160,
-        0.1915, 0.3582, 0.0577, 0.0159, 0.1337,
-        0.1405, 0.0000, 0.0873, 0.2261, 0.1676,
-        0.2280, 0.1422, -0.0698, 0.1631, 0.1221,
-        0.0199, 0.1648, 0.3250, 0.1697, 0.1588,
-        0.0550, 0.1812, 0.3172, 0.1897, 0.2140,
-        0.3364, 0.2274, 0.3300, 0.2965, 0.2210,
-        0.3718, 0.2390, 0.0911, 0.0744, 0.1953,
-        0.1814, 0.2689, 0.0989, 0.1230, 0.2296,
-        0.2123, 0.3370, 0.2268, 0.3720, 0.3147,
-        0.0170, 0.1210, 0.2027, 0.1947, 0.3101,
-        0.2589, -0.0897, 0.0492, 0.1659, 0.3192,
-        0.0549, -0.3700, 0.2646, 0.1558, 0.1088,
-        0.2836, -0.0910, -0.1189, -0.2210, 0.2104,
-        0.2858, 0.3336, 0.2296, 0.3758, 0.0132,
-        0.1008, 0.0762, 0.3047, -0.0310, 0.3169,
-        0.0525, 0.1867, 0.3173, 0.0627, 0.2155,
-        0.3250, 0.1861, 0.0657, 0.2370, 0.3723,
-        0.3240, 0.0683, 0.2256, 0.2155, 0.1840,
-        0.1641, 0.1224, 0.2580, 0.2388, 0.2871,
-        0.1830, 0.1254, 0.1840, 0.3150, 0.1761,
-        0.2502, 0.2629, -0.1811, 0.2871, 0.1544
-    ]
-
-    return random.choice(historical_returns)
+    return t.rvs(
+        df=SP_T_DF,
+        loc=SP_MEAN,
+        scale=_student_t_scale(SP_STD, SP_T_DF)
+    )
 
 
 # ============================================================
-# REIT MODEL
-# ============================================================
-
-def simulated_reit_return():
-
-    return truncnorm.rvs(
-        -5.43,
-        7.42,
-        loc=REIT_MEAN,
-        scale=REIT_STD
-    ) / 100
-
-
-# ============================================================
-# OTHER ASSET MODEL / GOLD
+# GOLD MODEL
 # ============================================================
 
 def simulated_asset_return():
+    """
+    Generate a gold annual return from a heavy-tailed Student-t
+    distribution centered at 8%.
 
-    return truncnorm.rvs(
-        -5.43,
-        7.42,
-        loc=8,
-        scale=7
-    ) / 100
+    Gold is intentionally more volatile and has heavier tails than
+    the S&P 500.
+    """
+
+    return t.rvs(
+        df=GOLD_T_DF,
+        loc=GOLD_MEAN,
+        scale=_student_t_scale(GOLD_STD, GOLD_T_DF)
+    )
 
 
 # ============================================================
@@ -253,10 +279,7 @@ def percentile_value(values, percentile):
     if not values:
         return 0
 
-    position = (
-        percentile
-        * (len(values) - 1)
-    )
+    position = percentile * (len(values) - 1)
 
     lower = int(position)
     upper = min(lower + 1, len(values) - 1)
@@ -265,37 +288,43 @@ def percentile_value(values, percentile):
 
     return (
         values[lower]
-        + (values[upper] - values[lower])
-        * fraction
+        + (values[upper] - values[lower]) * fraction
     )
 
 
-def simulated_individual_stock_return(
-    historical_returns
-):
+def get_stock_sector(stock_entry):
+    """
+    Accept either:
+        ("AAPL", 0.05)
+    or:
+        ("AAPL", 0.05, "Technology")
+
+    The third element is preferred because it makes sector
+    classification explicit.
+    """
+
+    ticker = stock_entry[0].upper()
+
+    if len(stock_entry) >= 3 and stock_entry[2]:
+        return str(stock_entry[2])
+
+    return STOCK_SECTORS.get(
+        ticker,
+        DEFAULT_STOCK_SECTOR
+    )
+
+
+def stock_distribution_parameters(historical_returns):
+    """
+    Calculate the stock's historical mean/std after winsorization
+    and shrink its mean toward the long-run equity target.
+    """
 
     if not historical_returns:
-
-        return 0.0
-
-    # --------------------------------------------------------
-    # If very little historical data exists, use a conservative
-    # normal model around the long-run target.
-    # --------------------------------------------------------
+        return STOCK_TARGET_RETURN, 0.25
 
     if len(historical_returns) < 5:
-
-        return random.gauss(
-            STOCK_TARGET_RETURN,
-            0.25
-        )
-
-    # --------------------------------------------------------
-    # Winsorize extreme historical observations.
-    #
-    # This prevents one spectacular or catastrophic historical
-    # year from determining the entire future model.
-    # --------------------------------------------------------
+        return STOCK_TARGET_RETURN, 0.25
 
     lower_bound = percentile_value(
         historical_returns,
@@ -308,63 +337,73 @@ def simulated_individual_stock_return(
     )
 
     winsorized = [
-        min(
-            max(value, lower_bound),
-            upper_bound
-        )
+        min(max(value, lower_bound), upper_bound)
         for value in historical_returns
     ]
 
-    historical_mean = statistics.mean(
-        winsorized
-    )
-
-    historical_std = statistics.stdev(
-        winsorized
-    )
-
-    # --------------------------------------------------------
-    # Shrink historical mean toward a more conservative
-    # long-run equity expectation.
-    # --------------------------------------------------------
+    historical_mean = statistics.mean(winsorized)
+    historical_std = statistics.stdev(winsorized)
 
     adjusted_mean = (
-        historical_mean
-        * (1 - STOCK_MEAN_SHRINKAGE)
-        + STOCK_TARGET_RETURN
-        * STOCK_MEAN_SHRINKAGE
+        historical_mean * (1 - STOCK_MEAN_SHRINKAGE)
+        + STOCK_TARGET_RETURN * STOCK_MEAN_SHRINKAGE
     )
 
-    # --------------------------------------------------------
-    # Student-t distribution.
-    #
-    # scipy's t distribution has variance:
-    #
-    #     df / (df - 2) * scale^2
-    #
-    # So this scale adjustment approximately preserves the
-    # historical standard deviation while adding fat tails.
-    # --------------------------------------------------------
+    return adjusted_mean, max(historical_std, 0.01)
 
-    scale = (
-        historical_std
-        * ((STOCK_T_DF - 2) / STOCK_T_DF) ** 0.5
+
+def simulated_individual_stock_return(
+    historical_returns,
+    sector_shock=0.0
+):
+    """
+    Generate one stock return.
+
+    The stock retains its own historical mean/volatility, while a
+    common sector shock creates positive correlation among stocks
+    in the same sector.
+
+    sector_shock should be a standard-normal draw shared by every
+    stock in the same sector for that simulated year.
+    """
+
+    mean, historical_std = stock_distribution_parameters(
+        historical_returns
     )
 
-    if scale <= 0:
+    rho = max(
+        0.0,
+        min(STOCK_SECTOR_CORRELATION, 0.95)
+    )
 
-        return adjusted_mean
+    # The common sector component accounts for rho of variance.
+    sector_component = (
+        math.sqrt(rho)
+        * historical_std
+        * sector_shock
+    )
 
-    simulated_return = t.rvs(
+    # The idiosyncratic component gets the remaining variance.
+    idio_std = historical_std * math.sqrt(1.0 - rho)
+
+    idio_scale = _student_t_scale(
+        idio_std,
+        STOCK_T_DF
+    )
+
+    idio_component = t.rvs(
         df=STOCK_T_DF,
-        loc=adjusted_mean,
-        scale=scale
+        loc=0.0,
+        scale=idio_scale
     )
 
-    return max(
-        simulated_return,
-        -1.0
+    simulated_return = (
+        mean
+        + sector_component
+        + idio_component
     )
+
+    return max(simulated_return, -1.0)
 
 
 # ============================================================
@@ -376,55 +415,53 @@ def calculate_return(
     ticker_list,
     stocks,
     bonds,
-    reits,
     assets,
+    tbill_rate,
     show_breakdown=False
 ):
+    """
+    Calculate one year's portfolio return.
 
-    individual_stock_return = 0
+    Returns:
+        (total_return, next_tbill_rate)
+    """
+
+    individual_stock_return = 0.0
+
+    # One common shock per sector per simulated year.
+    sector_shocks = {}
 
     for i in range(len(ticker_list)):
 
-        simulated_return = (
-            simulated_individual_stock_return(
-                annual_returns[i]
-            )
+        sector = get_stock_sector(ticker_list[i])
+
+        if sector not in sector_shocks:
+            sector_shocks[sector] = random.gauss(0.0, 1.0)
+
+        simulated_return = simulated_individual_stock_return(
+            annual_returns[i],
+            sector_shocks[sector]
         )
 
         individual_stock_return += (
-            simulated_return
-            * ticker_list[i][1]
+            simulated_return * ticker_list[i][1]
         )
 
     sp_return = simulated_sp_return()
+    sp_contribution = stocks * sp_return
 
-    sp_contribution = (
-        stocks * sp_return
+    next_tbill_rate = simulated_tbill_return(
+        tbill_rate
     )
-
-    bond_return = simulated_tbill_return()
-
-    bond_contribution = (
-        bonds * bond_return
-    )
-
-    reit_return = simulated_reit_return()
-
-    reit_contribution = (
-        reits * reit_return
-    )
+    bond_contribution = bonds * next_tbill_rate
 
     asset_return = simulated_asset_return()
-
-    asset_contribution = (
-        assets * asset_return
-    )
+    asset_contribution = assets * asset_return
 
     total_return = (
         individual_stock_return
         + sp_contribution
         + bond_contribution
-        + reit_contribution
         + asset_contribution
     )
 
@@ -448,13 +485,13 @@ def calculate_return(
         )
 
         print(
-            f"REITs:              "
-            f"{reit_contribution * 100:.2f}%"
+            f"Gold/other assets:  "
+            f"{asset_contribution * 100:.2f}%"
         )
 
         print(
-            f"Other assets:       "
-            f"{asset_contribution * 100:.2f}%"
+            f"T-bill rate:        "
+            f"{next_tbill_rate * 100:.2f}%"
         )
 
         print(
@@ -464,7 +501,7 @@ def calculate_return(
 
         print("------------------------\n")
 
-    return total_return
+    return total_return, next_tbill_rate
 
 
 # ============================================================
@@ -474,20 +511,18 @@ def calculate_return(
 def check_allocation(
     stocks,
     bonds,
-    reits,
     assets,
     ticker_list
 ):
 
     stock_weight = sum(
         weight
-        for _, weight in ticker_list
+        for _, weight, *rest in ticker_list
     )
 
     total = (
         stocks
         + bonds
-        + reits
         + assets
         + stock_weight
     )
@@ -496,8 +531,7 @@ def check_allocation(
 
     print(f"S&P 500:       {stocks:.2%}")
     print(f"T-bills:       {bonds:.2%}")
-    print(f"REITs:         {reits:.2%}")
-    print(f"Other assets:  {assets:.2%}")
+    print(f"Gold/other:     {assets:.2%}")
     print(f"Individual:    {stock_weight:.2%}")
     print(f"TOTAL:         {total:.2%}")
 
@@ -535,7 +569,6 @@ later_annual_returns = stock_data(
 check_allocation(
     INITIAL_PERCENT_S_AND_P,
     INITIAL_PERCENT_BONDS,
-    INITIAL_PERCENT_REITS,
     INITIAL_PERCENT_ASSETS,
     INITIAL_STOCKS_LIST
 )
@@ -543,7 +576,6 @@ check_allocation(
 check_allocation(
     LATER_PERCENT_S_AND_P,
     LATER_PERCENT_BONDS,
-    LATER_PERCENT_REITS,
     LATER_PERCENT_ASSETS,
     LATER_STOCKS_LIST
 )
@@ -585,6 +617,9 @@ for simulation in range(NUM_SIMULATIONS):
     portfolio_value = 300000
     success = True
 
+    # Each Monte Carlo path gets its own evolving T-bill rate.
+    tbill_rate = TBILL_INITIAL_RATE
+
     simulation_values = {
         year: 0.0
         for year in tracked_years
@@ -594,13 +629,13 @@ for simulation in range(NUM_SIMULATIONS):
     # 2027
     # --------------------------------------------------------
 
-    annual_return = calculate_return(
+    annual_return, tbill_rate = calculate_return(
         initial_annual_returns,
         INITIAL_STOCKS_LIST,
         INITIAL_PERCENT_S_AND_P,
         INITIAL_PERCENT_BONDS,
-        INITIAL_PERCENT_REITS,
-        INITIAL_PERCENT_ASSETS
+        INITIAL_PERCENT_ASSETS,
+        tbill_rate
     )
 
     portfolio_value *= (
@@ -619,13 +654,13 @@ for simulation in range(NUM_SIMULATIONS):
 
     for j in range(5):
 
-        annual_return = calculate_return(
+        annual_return, tbill_rate = calculate_return(
             initial_annual_returns,
             INITIAL_STOCKS_LIST,
             INITIAL_PERCENT_S_AND_P,
             INITIAL_PERCENT_BONDS,
-            INITIAL_PERCENT_REITS,
-            INITIAL_PERCENT_ASSETS
+            INITIAL_PERCENT_ASSETS,
+            tbill_rate
         )
 
         portfolio_value *= (
@@ -682,13 +717,13 @@ for simulation in range(NUM_SIMULATIONS):
 
                 break
 
-            annual_return = calculate_return(
+            annual_return, tbill_rate = calculate_return(
                 later_annual_returns,
                 LATER_STOCKS_LIST,
                 LATER_PERCENT_S_AND_P,
                 LATER_PERCENT_BONDS,
-                LATER_PERCENT_REITS,
-                LATER_PERCENT_ASSETS
+                LATER_PERCENT_ASSETS,
+                tbill_rate
             )
 
             portfolio_value *= (
