@@ -664,40 +664,31 @@ def project_initial_portfolio_to_2033(portfolio_value):
 
 
 def calculate_variable_withdrawal(portfolio_before_withdrawal):
-    """
-    Determine the variable withdrawal from current portfolio health.
+    """Choose the variable withdrawal based on actual funding health.
 
-    The $50k minimum is reserved for genuine funding stress. Once the
-    portfolio can safely support the normal $100k withdrawal while still
-    funding the remaining mandatory $50k payments, healthier portfolios
-    step up through $125k and $150k.
+    The $50k amount is reserved for a portfolio that cannot safely
+    fund the variable withdrawal plus the ten scheduled $50k payments
+    at the central T-bill return. Otherwise, healthier portfolios get
+    a larger variable withdrawal, with tiers based on the balance.
     """
 
-    # Balance required to make a $100k variable withdrawal now and then
-    # the remaining nine $50k annual payments, assuming the central
-    # nominal T-bill return.
-    standard_required_balance = required_starting_balance(
-        [WITHDRAWAL_STANDARD_AMOUNT]
-        + [ANNUAL_WITHDRAWAL]
-        * (WITHDRAWAL_REMAINING_PAYMENT_COUNT - 1),
+    # Danger threshold: enough to cover the variable withdrawal and
+    # all ten subsequent $50k payments, assuming the safe nominal rate.
+    danger_required_balance = required_starting_balance(
+        [WITHDRAWAL_MINIMUM_AMOUNT]
+        + [ANNUAL_WITHDRAWAL] * WITHDRAWAL_REMAINING_PAYMENT_COUNT,
         TBILL_LONG_RUN_RATE
     )
 
-    # Truly endangered: use only the $50k minimum.
-    if portfolio_before_withdrawal < standard_required_balance:
+    if portfolio_before_withdrawal < danger_required_balance:
         return WITHDRAWAL_MINIMUM_AMOUNT
 
-    # Healthy enough for the normal $100k contribution.
     if portfolio_before_withdrawal < WITHDRAWAL_TARGET_VALUE:
         return WITHDRAWAL_STANDARD_AMOUNT
 
-    # Stronger portfolio: $125k.
     if portfolio_before_withdrawal < WITHDRAWAL_VERY_HEALTHY_VALUE:
         return WITHDRAWAL_HEALTHY_AMOUNT
 
-    # Very healthy portfolio: $150k. This is intentionally the upper
-    # end of the normal policy so exceptional simulation paths do not
-    # distort the average variable contribution.
     return WITHDRAWAL_VERY_HEALTHY_AMOUNT
 
 def establish_variable_withdrawal_range(portfolio_at_beginning_2031):
