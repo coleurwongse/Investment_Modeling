@@ -14,9 +14,9 @@ from collections import defaultdict
 # PORTFOLIO ALLOCATIONS
 # ============================================================
 
-INITIAL_PERCENT_S_AND_P = 0.64
+INITIAL_PERCENT_S_AND_P = 0.66
 INITIAL_PERCENT_BONDS = 0.34
-INITIAL_PERCENT_ASSETS = 0.02
+INITIAL_PERCENT_ASSETS = 0.0
 
 LATER_PERCENT_S_AND_P = 0.45
 LATER_PERCENT_BONDS = 0.55
@@ -38,16 +38,28 @@ ANNUAL_WITHDRAWAL = 50000
 #    portfolio and establish the allowed withdrawal range.
 # 2. At the beginning of 2033, calculate the withdrawal again
 #    using the actual portfolio, then clamp it to that range.
+# Exception: if the actual beginning-of-2033 portfolio is above
+# WITHDRAWAL_RETAINED_VALUE, everything above it is withdrawn and the
+# retained balance is moved entirely into bonds for 2033-2042. If that
+# excess is smaller than the regular $50k payment, everything above
+# WITHDRAWAL_RETAINED_FLOOR_VALUE is withdrawn instead.
+#
+# The variable withdrawal is separate from the regular $50k payment,
+# which is always taken in 2033 as well. Amounts below are the
+# variable portion only.
+WITHDRAWAL_RETAINED_VALUE = 500000
+WITHDRAWAL_RETAINED_FLOOR_VALUE = 450000
 WITHDRAWAL_TARGET_VALUE = 500000
 WITHDRAWAL_LARGE_AMOUNT = 200000
 WITHDRAWAL_STANDARD_AMOUNT = 100000
-WITHDRAWAL_HEALTHY_AMOUNT = 120000
+WITHDRAWAL_HEALTHY_AMOUNT = 125000
 WITHDRAWAL_VERY_HEALTHY_AMOUNT = 150000
-WITHDRAWAL_MINIMUM_AMOUNT = 50000
+WITHDRAWAL_MINIMUM_AMOUNT = 0
 
-# $50k is reserved for portfolios that cannot safely support the
-# normal $100k variable withdrawal while still funding the remaining
-# $50k annual payments at the central T-bill return.
+# The minimum (no variable withdrawal, only the regular $50k) is
+# reserved for portfolios that cannot safely support the normal $100k
+# variable withdrawal while still funding the remaining $50k annual
+# payments at the central T-bill return.
 WITHDRAWAL_REMAINING_PAYMENT_COUNT = 10
 WITHDRAWAL_VERY_HEALTHY_VALUE = 700000
 
@@ -113,10 +125,20 @@ STOCK_TARGET_RETURN = 0.08
 STOCK_MEAN_SHRINKAGE = 0.50
 STOCK_T_DF = 5
 
-# Fraction of each stock's variance driven by its sector factor.
-# 0.30 means stocks in the same sector have meaningful positive
-# correlation without moving identically.
+# Fraction of each stock's non-market variance driven by its sector
+# factor. 0.30 means stocks in the same sector have meaningful extra
+# positive correlation without moving identically.
 STOCK_SECTOR_CORRELATION = 0.30
+
+# Correlation between individual stocks and the S&P 500. This is
+# replaced at startup by the average historical correlation of the
+# configured stocks with the S&P 500, capped so stocks never move in
+# lockstep with the index.
+STOCK_SP_CORRELATION = 0.0
+STOCK_MAX_SP_CORRELATION = 0.80
+
+# Minimum overlapping years needed to use a stock's correlation.
+STOCK_MIN_CORRELATION_YEARS = 5
 
 # If a stock tuple only has (ticker, weight), it uses this sector.
 DEFAULT_STOCK_SECTOR = "Other"
@@ -173,81 +195,132 @@ def simulated_tbill_return(current_rate):
 # HISTORICAL DATA
 # ============================================================
 
-def stock_data(ticker_list):
+# Annual returns keyed by year, cached per ticker so the S&P
+# correlation calculation does not download the same data twice.
+_returns_by_year_cache = {}
+SP500_CACHE_KEY = "__SP500_INDEX__"
 
-    if ticker_list and usstock is None:
-        raise ModuleNotFoundError(
-            "usstock is required when individual stock tickers are configured."
-        )
+
+def stock_data(ticker_list):
+    """Annual-return lists (oldest first) for each configured stock."""
 
     annual_returns = []
 
     for ticker in ticker_list:
 
-        rows = usstock.chart(
-            ticker[0],
-            period="max",
-            interval="1d"
-        ).get("rows", [])
+        returns_by_year = stock_returns_by_year(ticker[0])
 
-        rows.sort(key=lambda row: row["date"])
-
-        by_year = defaultdict(list)
-
-        for row in rows:
-            year = int(str(row["date"])[:4])
-            by_year[year].append(row)
-
-        years = sorted(by_year)
-
-        temp_stock_returns = []
-
-        previous_year_end = None
-
-        for year in years:
-
-            year_rows = by_year[year]
-
-            if not year_rows:
-                continue
-
-            first_row = year_rows[0]
-            last_row = year_rows[-1]
-
-            start_price = (
-                first_row.get("adjusted_close")
-                or first_row.get("adjclose")
-                or first_row.get("close")
-            )
-
-            end_price = (
-                last_row.get("adjusted_close")
-                or last_row.get("adjclose")
-                or last_row.get("close")
-            )
-
-            if start_price is None or end_price is None:
-                continue
-
-            start_price = float(start_price)
-            end_price = float(end_price)
-
-            if end_price <= 0:
-                continue
-
-            if previous_year_end is not None and previous_year_end > 0:
-
-                annual_return = (
-                    end_price / previous_year_end
-                ) - 1
-
-                temp_stock_returns.append(annual_return)
-
-            previous_year_end = end_price
-
-        annual_returns.append(temp_stock_returns)
+        annual_returns.append([
+            returns_by_year[year]
+            for year in sorted(returns_by_year)
+        ])
 
     return annual_returns
+
+
+def stock_returns_by_year(ticker):
+    """Return {year: annual return} for one stock ticker."""
+
+    ticker = ticker.upper()
+
+    if ticker in _returns_by_year_cache:
+        return _returns_by_year_cache[ticker]
+
+    if usstock is None:
+        raise ModuleNotFoundError(
+            "usstock is required when individual stock tickers are configured."
+        )
+
+    rows = usstock.chart(
+        ticker,
+        period="max",
+        interval="1d"
+    ).get("rows", [])
+
+    returns_by_year = annual_returns_from_rows(rows)
+
+    _returns_by_year_cache[ticker] = returns_by_year
+
+    return returns_by_year
+
+
+def sp500_returns_by_year():
+    """Return {year: annual return} for the S&P 500 index."""
+
+    if SP500_CACHE_KEY in _returns_by_year_cache:
+        return _returns_by_year_cache[SP500_CACHE_KEY]
+
+    if usstock is None:
+        raise ModuleNotFoundError(
+            "usstock is required when individual stock tickers are configured."
+        )
+
+    rows = usstock.ohlcv_history("SPX").get("rows", [])
+
+    returns_by_year = annual_returns_from_rows(rows)
+
+    _returns_by_year_cache[SP500_CACHE_KEY] = returns_by_year
+
+    return returns_by_year
+
+
+def annual_returns_from_rows(rows):
+    """Convert daily price rows into {year: year-end to year-end return}."""
+
+    rows = sorted(rows, key=lambda row: row["date"])
+
+    by_year = defaultdict(list)
+
+    for row in rows:
+        year = int(str(row["date"])[:4])
+        by_year[year].append(row)
+
+    years = sorted(by_year)
+
+    returns_by_year = {}
+
+    previous_year_end = None
+
+    for year in years:
+
+        year_rows = by_year[year]
+
+        if not year_rows:
+            continue
+
+        first_row = year_rows[0]
+        last_row = year_rows[-1]
+
+        start_price = (
+            first_row.get("adjusted_close")
+            or first_row.get("adjclose")
+            or first_row.get("close")
+        )
+
+        end_price = (
+            last_row.get("adjusted_close")
+            or last_row.get("adjclose")
+            or last_row.get("close")
+        )
+
+        if start_price is None or end_price is None:
+            continue
+
+        start_price = float(start_price)
+        end_price = float(end_price)
+
+        if end_price <= 0:
+            continue
+
+        if previous_year_end is not None and previous_year_end > 0:
+
+            returns_by_year[year] = (
+                end_price / previous_year_end
+            ) - 1
+
+        previous_year_end = end_price
+
+    return returns_by_year
 
 
 # ============================================================
@@ -386,21 +459,29 @@ def stock_distribution_parameters(historical_returns):
 
 def simulated_individual_stock_return(
     historical_returns,
-    sector_shock=0.0
+    sector_shock=0.0,
+    market_shock=0.0
 ):
     """
     Generate one stock return.
 
-    The stock retains its own historical mean/volatility, while a
-    common sector shock creates positive correlation among stocks
-    in the same sector.
+    The stock retains its own historical mean/volatility. A shared
+    S&P 500 shock gives every stock a correlation of
+    STOCK_SP_CORRELATION with the index, and a common sector shock
+    adds extra correlation among stocks in the same sector.
 
     sector_shock should be a standard-normal draw shared by every
     stock in the same sector for that simulated year.
+    market_shock should be that year's standardized S&P 500 return.
     """
 
     mean, historical_std = stock_distribution_parameters(
         historical_returns
+    )
+
+    beta = max(
+        -STOCK_MAX_SP_CORRELATION,
+        min(STOCK_SP_CORRELATION, STOCK_MAX_SP_CORRELATION)
     )
 
     rho = max(
@@ -408,15 +489,27 @@ def simulated_individual_stock_return(
         min(STOCK_SECTOR_CORRELATION, 0.95)
     )
 
-    # The common sector component accounts for rho of variance.
+    # The market component accounts for beta^2 of variance.
+    market_component = (
+        beta
+        * historical_std
+        * market_shock
+    )
+
+    # The sector and idiosyncratic components split the rest.
+    non_market_variance = 1.0 - beta ** 2
+
+    # The common sector component accounts for rho of that remainder.
     sector_component = (
-        math.sqrt(rho)
+        math.sqrt(rho * non_market_variance)
         * historical_std
         * sector_shock
     )
 
     # The idiosyncratic component gets the remaining variance.
-    idio_std = historical_std * math.sqrt(1.0 - rho)
+    idio_std = historical_std * math.sqrt(
+        (1.0 - rho) * non_market_variance
+    )
 
     idio_scale = _student_t_scale(
         idio_std,
@@ -431,6 +524,7 @@ def simulated_individual_stock_return(
 
     simulated_return = (
         mean
+        + market_component
         + sector_component
         + idio_component
     )
@@ -460,6 +554,11 @@ def calculate_return(
 
     individual_stock_return = 0.0
 
+    # The S&P 500 return is drawn first so individual stocks can
+    # share its shock.
+    sp_return = simulated_sp_return()
+    market_shock = (sp_return - SP_MEAN) / SP_STD
+
     # One common shock per sector per simulated year.
     sector_shocks = {}
 
@@ -472,14 +571,14 @@ def calculate_return(
 
         simulated_return = simulated_individual_stock_return(
             annual_returns[i],
-            sector_shocks[sector]
+            sector_shocks[sector],
+            market_shock
         )
 
         individual_stock_return += (
             simulated_return * ticker_list[i][1]
         )
 
-    sp_return = simulated_sp_return()
     sp_contribution = stocks * sp_return
 
     next_tbill_rate = simulated_tbill_return(
@@ -595,6 +694,87 @@ later_annual_returns = stock_data(
 
 
 # ============================================================
+# STOCK / S&P 500 CORRELATION
+# ============================================================
+
+def average_sp_correlation(ticker_lists):
+    """
+    Average historical correlation between each configured stock's
+    annual returns and the S&P 500's annual returns over the years
+    they overlap. Returns 0.0 when no usable stock is configured.
+    """
+
+    tickers = sorted({
+        stock_entry[0].upper()
+        for ticker_list in ticker_lists
+        for stock_entry in ticker_list
+    })
+
+    if not tickers:
+        return 0.0
+
+    sp_by_year = sp500_returns_by_year()
+
+    correlations = []
+
+    for ticker in tickers:
+
+        stock_by_year = stock_returns_by_year(ticker)
+
+        shared_years = sorted(
+            set(stock_by_year) & set(sp_by_year)
+        )
+
+        if len(shared_years) < STOCK_MIN_CORRELATION_YEARS:
+            print(
+                f"{ticker}: only {len(shared_years)} years overlap "
+                f"with the S&P 500; excluded from correlation."
+            )
+            continue
+
+        stock_returns = [stock_by_year[year] for year in shared_years]
+        sp_returns = [sp_by_year[year] for year in shared_years]
+
+        try:
+            correlation = statistics.correlation(
+                stock_returns,
+                sp_returns
+            )
+        except statistics.StatisticsError:
+            # One of the series is constant.
+            continue
+
+        print(
+            f"{ticker}: S&P 500 correlation {correlation:.3f} "
+            f"({len(shared_years)} years)"
+        )
+
+        correlations.append(correlation)
+
+    if not correlations:
+        return 0.0
+
+    return statistics.mean(correlations)
+
+
+historical_sp_correlation = average_sp_correlation(
+    [INITIAL_STOCKS_LIST, LATER_STOCKS_LIST]
+)
+
+STOCK_SP_CORRELATION = max(
+    -STOCK_MAX_SP_CORRELATION,
+    min(historical_sp_correlation, STOCK_MAX_SP_CORRELATION)
+)
+
+if INITIAL_STOCKS_LIST or LATER_STOCKS_LIST:
+    print(
+        f"Average stock/S&P 500 correlation: "
+        f"{historical_sp_correlation:.3f} "
+        f"(using {STOCK_SP_CORRELATION:.3f})"
+    )
+
+
+# ============================================================
 # CHECK ALLOCATIONS
 # ============================================================
 
@@ -645,10 +825,43 @@ def expected_initial_portfolio_return():
     )
 
 
-def expected_later_equity_return():
-    """Central expected nominal return for the stock/equity sleeve."""
+def later_equity_baseline():
+    """Total S&P + individual-stock weight in the default later mix."""
 
-    return SP_MEAN
+    return (
+        LATER_PERCENT_S_AND_P
+        + sum(
+            weight
+            for _, weight, *rest in LATER_STOCKS_LIST
+        )
+    )
+
+
+def expected_later_equity_return():
+    """
+    Central expected nominal return for the stock/equity sleeve: the
+    S&P 500 and the default later-phase individual stocks, blended by
+    their share of the sleeve.
+    """
+
+    total_equity_baseline = later_equity_baseline()
+
+    if total_equity_baseline <= 0:
+        return SP_MEAN
+
+    expected = LATER_PERCENT_S_AND_P * SP_MEAN
+
+    for i, stock_entry in enumerate(LATER_STOCKS_LIST):
+        if i < len(later_annual_returns):
+            mean, _ = stock_distribution_parameters(
+                later_annual_returns[i]
+            )
+        else:
+            mean = STOCK_TARGET_RETURN
+
+        expected += stock_entry[1] * mean
+
+    return expected / total_equity_baseline
 
 
 def project_initial_portfolio_to_2033(portfolio_value):
@@ -666,16 +879,18 @@ def project_initial_portfolio_to_2033(portfolio_value):
 def calculate_variable_withdrawal(portfolio_before_withdrawal):
     """Choose the variable withdrawal based on actual funding health.
 
-    The $50k amount is reserved for a portfolio that cannot safely
+    The minimum amount is reserved for a portfolio that cannot safely
     fund the variable withdrawal plus the ten scheduled $50k payments
     at the central T-bill return. Otherwise, healthier portfolios get
     a larger variable withdrawal, with tiers based on the balance.
+    The returned amount excludes the regular $50k 2033 payment.
     """
 
-    # Danger threshold: enough to cover the variable withdrawal and
-    # all ten subsequent $50k payments, assuming the safe nominal rate.
+    # Danger threshold: enough to cover the minimum 2033 withdrawal
+    # (variable + regular $50k) and ten more $50k payments, assuming
+    # the safe nominal rate.
     danger_required_balance = required_starting_balance(
-        [WITHDRAWAL_MINIMUM_AMOUNT]
+        [WITHDRAWAL_MINIMUM_AMOUNT + ANNUAL_WITHDRAWAL]
         + [ANNUAL_WITHDRAWAL] * WITHDRAWAL_REMAINING_PAYMENT_COUNT,
         TBILL_LONG_RUN_RATE
     )
@@ -825,22 +1040,27 @@ def determine_later_allocation(
     Determine the 2033-2042 stock/bond allocation from projected
     funding needs.
 
+    The stock sleeve is the S&P 500 plus the individual stocks in
+    the default later-phase allocation (LATER_STOCKS_LIST); no other
+    stocks are ever added. Its expected return blends all of them.
+
     - If T-bills alone can fund the remaining withdrawals: 100% bonds.
     - If stocks are not enough on a central-return basis: 100% stocks.
     - Otherwise interpolate the stock weight between those two cases.
 
+    The stock weight is split between the S&P 500 and each later
+    stock in proportion to their default later-phase weights.
+
     Later assets are retained only as a configured baseline; because
     LATER_PERCENT_ASSETS is currently 0%, the current implementation
     reduces to a stock/bond decision.
+
+    Returns:
+        (sp_weight, bond_weight, asset_weight, later_stocks), where
+        later_stocks is LATER_STOCKS_LIST with rescaled weights.
     """
 
-    total_equity_baseline = (
-        LATER_PERCENT_S_AND_P
-        + sum(
-            weight
-            for _, weight, *rest in LATER_STOCKS_LIST
-        )
-    )
+    total_equity_baseline = later_equity_baseline()
 
     if total_equity_baseline <= 0:
         # No stock sleeve is configured, so the only feasible allocation
@@ -848,11 +1068,17 @@ def determine_later_allocation(
         return (
             0.0,
             1.0 - LATER_PERCENT_ASSETS,
-            LATER_PERCENT_ASSETS
+            LATER_PERCENT_ASSETS,
+            []
         )
 
     bond_return = TBILL_LONG_RUN_RATE
     equity_return = expected_later_equity_return()
+
+    # Stocks are not expected to beat T-bills, so taking stock risk
+    # cannot help fund the withdrawals.
+    if equity_return <= bond_return:
+        return 0.0, 1.0, 0.0, []
 
     # Compare the current portfolio with the amount that would be
     # required if the remaining payments were funded entirely from
@@ -869,41 +1095,40 @@ def determine_later_allocation(
 
     # The portfolio already generates enough growth with T-bills.
     if portfolio_value >= bond_required:
-        return 0.0, 1.0, 0.0
+        stock_weight = 0.0
 
     # Even the central stock-return assumption is insufficient.
-    if portfolio_value <= equity_required:
-        return 1.0, 0.0, 0.0
+    elif portfolio_value <= equity_required:
+        stock_weight = 1.0
 
     # Otherwise interpolate between the all-bond and all-stock funding
     # cases. A portfolio only slightly short of the all-bond requirement
     # gets a small stock allocation; a much larger shortfall gets a
     # correspondingly stronger stock concentration.
-    stock_weight = (
-        bond_required - portfolio_value
-    ) / (
-        bond_required - equity_required
-    )
-
-    stock_weight = max(0.0, min(1.0, stock_weight))
-
-    # Keep the configured internal equity composition.
-    individual_weight_ratio = 0.0
-
-    if total_equity_baseline > 0:
-        individual_weight_ratio = (
-            sum(
-                weight
-                for _, weight, *rest in LATER_STOCKS_LIST
-            )
-            / total_equity_baseline
+    else:
+        stock_weight = (
+            bond_required - portfolio_value
+        ) / (
+            bond_required - equity_required
         )
 
-    individual_stock_weight = (
-        stock_weight * individual_weight_ratio
-    )
+        stock_weight = max(0.0, min(1.0, stock_weight))
 
-    sp_weight = stock_weight - individual_stock_weight
+    # Keep the configured internal equity composition: every holding
+    # in the stock sleeve is scaled by the same factor.
+    scale = stock_weight / total_equity_baseline
+
+    sp_weight = LATER_PERCENT_S_AND_P * scale
+
+    later_stocks = [
+        (
+            stock_entry[0],
+            stock_entry[1] * scale,
+            *stock_entry[2:]
+        )
+        for stock_entry in LATER_STOCKS_LIST
+    ]
+
     asset_weight = 0.0
     bond_weight = 1.0 - stock_weight
 
@@ -911,7 +1136,7 @@ def determine_later_allocation(
         sp_weight,
         bond_weight,
         asset_weight,
-        individual_stock_weight
+        later_stocks
     )
 
 
@@ -1047,11 +1272,34 @@ for simulation in range(NUM_SIMULATIONS):
     # Beginning of 2033: calculate variable withdrawal
     # --------------------------------------------------------
 
-    actual_variable_withdrawal = clamp_variable_withdrawal(
-        portfolio_value,
-        variable_withdrawal_low,
-        variable_withdrawal_high
-    )
+    # Above the retained value: withdraw the excess and hold the
+    # remaining balance entirely in bonds. The regular 2033 $50k
+    # payment comes out of that excess, so the variable portion is
+    # whatever is left over. If the excess is under $50k, withdraw
+    # everything above the lower floor instead. Otherwise use the
+    # tiered policy clamped to the range set in 2031.
+    all_bonds_after_2033 = portfolio_value > WITHDRAWAL_RETAINED_VALUE
+
+    if all_bonds_after_2033:
+        if (
+            portfolio_value - WITHDRAWAL_RETAINED_VALUE
+            >= ANNUAL_WITHDRAWAL
+        ):
+            retained_value = WITHDRAWAL_RETAINED_VALUE
+        else:
+            retained_value = WITHDRAWAL_RETAINED_FLOOR_VALUE
+
+        actual_variable_withdrawal = (
+            portfolio_value
+            - retained_value
+            - ANNUAL_WITHDRAWAL
+        )
+    else:
+        actual_variable_withdrawal = clamp_variable_withdrawal(
+            portfolio_value,
+            variable_withdrawal_low,
+            variable_withdrawal_high
+        )
 
     variable_withdrawal_values.append(actual_variable_withdrawal)
 
@@ -1064,8 +1312,11 @@ for simulation in range(NUM_SIMULATIONS):
     for j in range(10):
 
         # Current-year withdrawal happens at the beginning of the year.
+        # 2033 takes the variable withdrawal plus the regular $50k.
         if current_year == 2033:
-            current_withdrawal = actual_variable_withdrawal
+            current_withdrawal = (
+                actual_variable_withdrawal + ANNUAL_WITHDRAWAL
+            )
         else:
             current_withdrawal = ANNUAL_WITHDRAWAL
 
@@ -1090,37 +1341,20 @@ for simulation in range(NUM_SIMULATIONS):
             for _ in range(9 - j)
         ]
 
-        allocation = determine_later_allocation(
-            portfolio_value,
-            remaining_withdrawals
-        )
-
-        # The normal return function expects separate S&P, bond, asset,
-        # and individual-stock weights. determine_later_allocation
-        # returns the appropriate form for either case.
-        if len(allocation) == 3:
-            later_sp, later_bonds, later_assets = allocation
-            later_stocks = []
-        else:
-            later_sp, later_bonds, later_assets, individual_weight = allocation
-
-            base_individual = sum(
-                weight
-                for _, weight, *rest in LATER_STOCKS_LIST
+        if all_bonds_after_2033:
+            later_sp, later_bonds, later_assets, later_stocks = (
+                0.0, 1.0, 0.0, []
             )
-
-            if base_individual > 0:
-                scale = individual_weight / base_individual
-                later_stocks = [
-                    (
-                        stock_entry[0],
-                        stock_entry[1] * scale,
-                        *stock_entry[2:]
-                    )
-                    for stock_entry in LATER_STOCKS_LIST
-                ]
-            else:
-                later_stocks = []
+        else:
+            (
+                later_sp,
+                later_bonds,
+                later_assets,
+                later_stocks
+            ) = determine_later_allocation(
+                portfolio_value,
+                remaining_withdrawals
+            )
 
         portfolio_value -= current_withdrawal
 
