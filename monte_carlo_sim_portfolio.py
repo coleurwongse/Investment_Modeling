@@ -47,8 +47,16 @@ ANNUAL_WITHDRAWAL = 50000
 # The variable withdrawal is separate from the regular $50k payment,
 # which is always taken in 2033 as well. Amounts below are the
 # variable portion only.
-WITHDRAWAL_RETAINED_VALUE = 500000
-WITHDRAWAL_RETAINED_FLOOR_VALUE = 450000
+#
+# Kept amount: $460k in T-bills covers the nine $50k payments for
+# 2034-2042 with no failures in 200,000 simulated T-bill paths (median
+# ~$136k left in 2042). Going below ~$420k starts to risk running out
+# if rates fall. Lowering it by $X raises the variable withdrawal by $X.
+WITHDRAWAL_RETAINED_VALUE = 460000
+
+# Must be exactly $50k (one regular payment) below the kept amount, or
+# the variable withdrawal can go negative for balances just above it.
+WITHDRAWAL_RETAINED_FLOOR_VALUE = WITHDRAWAL_RETAINED_VALUE - ANNUAL_WITHDRAWAL
 WITHDRAWAL_TARGET_VALUE = 500000
 WITHDRAWAL_LARGE_AMOUNT = 200000
 WITHDRAWAL_STANDARD_AMOUNT = 100000
@@ -1301,6 +1309,8 @@ year_value_totals = {
 final_values = []
 successful_final_values = []
 variable_withdrawal_values = []
+went_all_bonds = []
+portfolio_2033_values = []
 
 
 # ============================================================
@@ -1437,6 +1447,8 @@ for simulation in range(NUM_SIMULATIONS):
         )
 
     variable_withdrawal_values.append(actual_variable_withdrawal)
+    went_all_bonds.append(all_bonds_after_2033)
+    portfolio_2033_values.append(portfolio_value)
 
     # --------------------------------------------------------
     # 2033-2042
@@ -1747,6 +1759,52 @@ for year in tracked_years:
     print(
         f"{year}: "
         f"${average_value:,.2f}"
+    )
+
+print("=" * 70)
+
+
+# ============================================================
+# WHERE THE 2042 OUTCOMES COME FROM
+# ============================================================
+# Paths above WITHDRAWAL_RETAINED_VALUE in 2033 pay out the excess and
+# sit in T-bills, so they all end up near the same 2042 value. Paths at
+# or below it are invested in stocks for 2033-2042, which is where both
+# the big 2042 outcomes and almost all failures come from.
+
+bond_finals = [
+    f for f, b in zip(final_values, went_all_bonds) if b
+]
+stock_finals = [
+    f for f, b in zip(final_values, went_all_bonds) if not b
+]
+
+sorted_2033 = sorted(portfolio_2033_values)
+
+print()
+print("=" * 70)
+print("2033 SPLIT")
+print("=" * 70)
+print(
+    f"2033 balance (before withdrawal) 10th/50th/90th pct: "
+    f"${sorted_2033[len(sorted_2033) // 10]:,.0f} / "
+    f"${statistics.median(sorted_2033):,.0f} / "
+    f"${sorted_2033[9 * len(sorted_2033) // 10]:,.0f}"
+)
+
+for label, group in (
+    (f"Above ${WITHDRAWAL_RETAINED_VALUE:,.0f} -> all T-bills", bond_finals),
+    (f"At/below ${WITHDRAWAL_RETAINED_VALUE:,.0f} -> stock/bond mix", stock_finals),
+):
+    if not group:
+        print(f"{label}: 0 paths")
+        continue
+    failures = sum(1 for f in group if f <= 0)
+    print(
+        f"{label}: {len(group) / len(final_values):.1%} of paths, "
+        f"avg 2042 ${statistics.mean(group):,.0f}, "
+        f"median ${statistics.median(group):,.0f}, "
+        f"failures {failures:,}"
     )
 
 print("=" * 70)
