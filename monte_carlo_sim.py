@@ -7,6 +7,7 @@ except ModuleNotFoundError:
 import statistics
 import random
 import math
+import datetime
 from collections import defaultdict
 
 
@@ -68,21 +69,6 @@ WITHDRAWAL_VERY_HEALTHY_VALUE = 700000
 # MODEL PARAMETERS
 # ============================================================
 
-# Long-run return toward which individual-stock historical
-# means are shrunk.
-STOCK_TARGET_RETURN = 0.08
-
-# 50% historical mean / 50% long-run target.
-STOCK_MEAN_SHRINKAGE = 0.50
-
-# Student-t degrees of freedom.
-# Lower = fatter tails.
-STOCK_T_DF = 5
-
-# Winsorization limits for historical stock returns.
-STOCK_LOWER_PERCENTILE = 0.05
-STOCK_UPPER_PERCENTILE = 0.95
-
 # ------------------------------------------------------------
 # S&P 500 model
 # ------------------------------------------------------------
@@ -121,8 +107,14 @@ GOLD_T_DF = 4
 # ------------------------------------------------------------
 # Individual-stock model
 # ------------------------------------------------------------
+# Long-run return toward which individual-stock historical
+# means are shrunk.
 STOCK_TARGET_RETURN = 0.08
+
+# 50% historical mean / 50% long-run target.
 STOCK_MEAN_SHRINKAGE = 0.50
+
+# Student-t degrees of freedom. Lower = fatter tails.
 STOCK_T_DF = 5
 
 # Fraction of each stock's non-market variance driven by its sector
@@ -231,13 +223,25 @@ def stock_returns_by_year(ticker):
             "usstock is required when individual stock tickers are configured."
         )
 
-    rows = usstock.chart(
-        ticker,
-        period="max",
-        interval="1d"
-    ).get("rows", [])
+    # Yahoo writes class shares as BRK-B rather than BRK.B.
+    try:
+        rows = usstock.chart(
+            ticker.replace(".", "-"),
+            period="max",
+            interval="1d"
+        ).get("rows", [])
+    except Exception as error:
+        raise RuntimeError(
+            f"Could not download price history for {ticker}: {error}"
+        ) from error
 
     returns_by_year = annual_returns_from_rows(rows)
+
+    if not returns_by_year:
+        print(
+            f"WARNING: no annual returns found for {ticker}; it will use "
+            f"the default {STOCK_TARGET_RETURN:.0%} mean / 25% volatility."
+        )
 
     _returns_by_year_cache[ticker] = returns_by_year
 
@@ -255,7 +259,17 @@ def sp500_returns_by_year():
             "usstock is required when individual stock tickers are configured."
         )
 
-    rows = usstock.ohlcv_history("SPX").get("rows", [])
+    # Same Yahoo source as the individual stocks so the years line up.
+    try:
+        rows = usstock.chart(
+            "^GSPC",
+            period="max",
+            interval="1mo"
+        ).get("rows", [])
+    except Exception as error:
+        raise RuntimeError(
+            f"Could not download S&P 500 history: {error}"
+        ) from error
 
     returns_by_year = annual_returns_from_rows(rows)
 
@@ -267,7 +281,23 @@ def sp500_returns_by_year():
 def annual_returns_from_rows(rows):
     """Convert daily price rows into {year: year-end to year-end return}."""
 
-    rows = sorted(rows, key=lambda row: row["date"])
+    # Yahoo sometimes returns rows with no close; skip them rather
+    # than discarding the whole year.
+    rows = sorted(
+        (
+            row for row in rows
+            if (
+                row.get("adjusted_close")
+                or row.get("adjclose")
+                or row.get("close")
+            ) is not None
+        ),
+        key=lambda row: row["date"]
+    )
+
+    # The current year is incomplete, so its year-to-date move is not
+    # an annual return.
+    current_year = datetime.date.today().year
 
     by_year = defaultdict(list)
 
@@ -312,7 +342,11 @@ def annual_returns_from_rows(rows):
         if end_price <= 0:
             continue
 
-        if previous_year_end is not None and previous_year_end > 0:
+        if (
+            previous_year_end is not None
+            and previous_year_end > 0
+            and year != current_year
+        ):
 
             returns_by_year[year] = (
                 end_price / previous_year_end
