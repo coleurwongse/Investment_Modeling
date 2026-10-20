@@ -57,6 +57,44 @@ MARGIN_STABLE_SLOPE = 0.5  # percentage points per year
 STOCK_LIST_URL = "https://stockanalysis.com/stocks/?page={page}"
 
 
+# ------------------------------------------------------------
+# DCF
+# ------------------------------------------------------------
+# Free cash flow starts from a normalized base (see below) and grows
+# at a rate that decays
+# exponentially from the historical growth rate toward terminal
+# growth:
+#     g(t) = g_terminal + (g_start - g_terminal) * exp(-k * (t - 1))
+# with k set by the half-life. After DCF_PROJECTION_YEARS, growth is
+# held at g_terminal forever (Gordon growth terminal value).
+DCF_TERMINAL_GROWTH = 0.03
+
+# Base free cash flow = average of TTM and the last N fiscal years, so
+# a cyclical company isn't valued off one peak (or trough) year.
+# 0 = TTM only.
+DCF_BASE_FISCAL_YEARS = 2
+
+# Years for the gap between current and terminal growth to halve.
+DCF_GROWTH_HALF_LIFE_YEARS = 3
+
+# Long enough that growth has essentially reached terminal growth
+# (with a 3-year half-life only ~1% of the gap is left at year 20).
+DCF_PROJECTION_YEARS = 20
+
+# Historical growth is clamped to this range before extrapolating,
+# so one unusual period doesn't produce an absurd valuation.
+DCF_MIN_START_GROWTH = -0.10
+DCF_MAX_START_GROWTH = 0.25
+
+# Discount rate: stockanalysis's WACC. If it isn't reported, use
+# CAPM: risk-free rate + beta * equity risk premium.
+DCF_EQUITY_RISK_PREMIUM = 0.055
+
+# The terminal value explodes as the discount rate approaches
+# terminal growth, so require at least this much of a gap.
+DCF_MIN_RATE_SPREAD = 0.01
+
+
 # ============================================================
 # BASIC HELPERS
 # ============================================================
@@ -670,6 +708,151 @@ def income_metrics(income_data, cashflow_data):
     row["earnings_volatility"] = earnings_volatility(
         fiscal_series(income_data.get("Net Income"))
     )
+
+    return row
+
+
+def dcf_growth_path(start_growth):
+    """Yearly growth rates decaying exponentially to terminal growth."""
+    decay = math.log(2) / DCF_GROWTH_HALF_LIFE_YEARS
+    return [
+        DCF_TERMINAL_GROWTH
+        + (start_growth - DCF_TERMINAL_GROWTH) * math.exp(-decay * (year - 1))
+        for year in range(1, DCF_PROJECTION_YEARS + 1)
+    ]
+
+
+def dcf_metrics(stats, income_data, cashflow_data, price, risk_free):
+    """
+    Discounted cash flow value per share. Every output is blank with a
+    reason in dcf_note when an input is missing or the result would be
+    meaningless (e.g. negative free cash flow).
+    """
+    row = {
+        "dcf_value_per_share": None,
+        "dcf_upside_pct": None,
+        "dcf_base_fcf": None,
+        "dcf_base_fcf_periods": None,
+        "dcf_start_growth_pct": None,
+        "dcf_growth_basis": None,
+        "dcf_discount_rate_pct": None,
+        "dcf_terminal_value_share_pct": None,
+        "dcf_note": None,
+    }
+
+    def skip(reason):
+        row["dcf_note"] = reason
+        return row
+
+    # Base cash flow: average of TTM and the last few fiscal years.
+    # Statement figures are in millions; the statistics page's TTM
+    # figure is in dollars and fills in when a statement has no TTM.
+    fcf_series = (cashflow_data or {}).get("Free Cash Flow") or {}
+    base_values = []
+    base_periods = []
+
+    if fcf_series.get("TTM") is not None:
+        ttm = fcf_series["TTM"] * 1e6
+    else:
+        ttm = parse_number(stats.get("Free Cash Flow"))
+    if ttm is not None:
+        base_values.append(ttm)
+        base_periods.append("TTM")
+
+    if DCF_BASE_FISCAL_YEARS > 0:
+        for year, value in fiscal_series(fcf_series)[-DCF_BASE_FISCAL_YEARS:]:
+            base_values.append(value * 1e6)
+            base_periods.append(f"FY{year}")
+
+    if not base_values:
+        return skip("no free cash flow reported")
+
+    base_fcf = statistics.mean(base_values)
+    row["dcf_base_fcf"] = base_fcf
+    row["dcf_base_fcf_periods"] = "+".join(base_periods)
+
+    if base_fcf <= 0:
+        return skip("negative average free cash flow")
+
+    # Starting growth: revenue CAGR is steadier than FCF CAGR (FCF
+    # swings with capex and working capital), so prefer it.
+    start_growth = growth_cagr(fiscal_series((income_data or {}).get("Revenue")))
+    basis = "revenue CAGR"
+    if start_growth is None:
+        start_growth = growth_cagr(
+            fiscal_series((cashflow_data or {}).get("Free Cash Flow"))
+        )
+        basis = "FCF CAGR"
+    if start_growth is None:
+        return skip("no usable growth history")
+
+    start_growth = max(
+        DCF_MIN_START_GROWTH, min(start_growth, DCF_MAX_START_GROWTH)
+    )
+
+    # Discount rate.
+    wacc = parse_number(stats.get("Weighted Average Cost of Capital (WACC)"))
+    if wacc is not None:
+        discount_rate = wacc / 100
+    else:
+        beta = parse_number(stats.get("Beta (5Y)"))
+        if beta is None or risk_free is None:
+            return skip("no WACC or beta for a discount rate")
+        discount_rate = risk_free + beta * DCF_EQUITY_RISK_PREMIUM
+
+    if discount_rate - DCF_TERMINAL_GROWTH < DCF_MIN_RATE_SPREAD:
+        return skip(
+            f"discount rate {discount_rate:.1%} too close to "
+            f"terminal growth {DCF_TERMINAL_GROWTH:.1%}"
+        )
+
+    # Project and discount the cash flows.
+    fcf = base_fcf
+    present_value = 0.0
+    for year, growth in enumerate(dcf_growth_path(start_growth), start=1):
+        fcf *= 1 + growth
+        present_value += fcf / (1 + discount_rate) ** year
+
+    terminal_value = (
+        fcf * (1 + DCF_TERMINAL_GROWTH)
+        / (discount_rate - DCF_TERMINAL_GROWTH)
+    )
+    terminal_present_value = (
+        terminal_value / (1 + discount_rate) ** DCF_PROJECTION_YEARS
+    )
+    enterprise_value = present_value + terminal_present_value
+
+    # Equity value: add net cash (negative when the company has net debt).
+    net_cash = parse_number(stats.get("Net Cash")) or 0.0
+    equity_value = enterprise_value + net_cash
+
+    # Market cap / price gives the share count in the quoted share class
+    # (e.g. BRK.A vs BRK.B), falling back to shares outstanding.
+    market_cap = parse_number(stats.get("Market Cap"))
+    if market_cap and price:
+        shares = market_cap / price
+    else:
+        shares = parse_number(stats.get("Shares Outstanding"))
+    if not shares:
+        return skip("no share count")
+
+    value_per_share = equity_value / shares
+
+    row.update({
+        "dcf_value_per_share": value_per_share,
+        "dcf_upside_pct": (
+            as_percent(value_per_share / price - 1) if price else None
+        ),
+        "dcf_start_growth_pct": as_percent(start_growth),
+        "dcf_growth_basis": basis,
+        "dcf_discount_rate_pct": as_percent(discount_rate),
+        "dcf_terminal_value_share_pct": as_percent(
+            terminal_present_value / enterprise_value
+        ),
+    })
+
+    if equity_value <= 0:
+        row["dcf_note"] = "net debt exceeds the value of the cash flows"
 
     return row
 

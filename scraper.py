@@ -7,8 +7,10 @@ Usage:
     python scraper.py AAPL MSFT JPM   # tickers from the command line
 
 All data comes from the usstock library (see stock_metrics.py).
-Not included because they are projections rather than solid data:
-DCF and sector terminal growth.
+
+The DCF is an estimate, not reported data: it extrapolates historical
+growth, decaying toward 3% terminal growth (settings in
+stock_metrics.py). Sector terminal growth isn't scraped.
 """
 
 import sys
@@ -18,6 +20,7 @@ from stock_metrics import (
     MarketContext,
     balance_metrics,
     company_profile,
+    dcf_metrics,
     income_metrics,
     key_statistics,
     latest_prices,
@@ -54,6 +57,12 @@ COLUMNS = [
     # Valuation
     "pe_ratio", "ev_ebitda", "ev_ebitda_last_fy",
     "ev_ebitda_change_vs_last_fy_pct",
+
+    # DCF (estimate)
+    "dcf_value_per_share", "dcf_upside_pct", "dcf_base_fcf",
+    "dcf_base_fcf_periods", "dcf_start_growth_pct",
+    "dcf_growth_basis", "dcf_discount_rate_pct",
+    "dcf_terminal_value_share_pct", "dcf_note",
 
     # Leverage
     "debt_to_equity", "debt_to_equity_trend",
@@ -139,6 +148,15 @@ def scrape_ticker(symbol, context, prices_now):
         row.update(attempt(
             "income statement",
             lambda: income_metrics(income_data, cashflow_data or {})
+        ) or {})
+
+    if stats:
+        row.update(attempt(
+            "dcf",
+            lambda: dcf_metrics(
+                stats, income_data, cashflow_data,
+                row.get("price"), context.risk_free
+            )
         ) or {})
 
     profile = attempt("profile", lambda: company_profile(symbol))
