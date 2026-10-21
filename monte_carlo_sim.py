@@ -241,6 +241,15 @@ def stock_returns_by_year(ticker):
 
     returns_by_year = annual_returns_from_rows(rows)
 
+    # stock_distribution_parameters needs 5 annual returns; with fewer
+    # it silently uses the defaults, so say so.
+    if rows and len(returns_by_year) < 5:
+        print(
+            f"WARNING: {ticker} has only {len(returns_by_year)} full years "
+            f"of price history; using default "
+            f"{STOCK_TARGET_RETURN:.0%} return / 25% volatility."
+        )
+
     _returns_by_year_cache[ticker] = returns_by_year
 
     return returns_by_year
@@ -290,6 +299,25 @@ def _yahoo_rows_with_adjclose(ticker, interval):
             "close": close,
             "adjclose": adjclose,
         })
+
+    # A dividend-adjusted close is the close scaled down by past
+    # dividends, so it must be positive and no higher than the close.
+    # Yahoo's adjustment is occasionally corrupt (e.g. RGEDF has
+    # adjusted closes of -$4 billion); if so, use the plain closes.
+    corrupt = any(
+        row["adjclose"] is not None
+        and row["close"] is not None
+        and not 0 < row["adjclose"] <= row["close"] * 1.01
+        for row in rows
+    )
+
+    if corrupt:
+        print(
+            f"WARNING: {ticker} has invalid dividend-adjusted prices on "
+            f"Yahoo; using unadjusted closes (dividends not included)."
+        )
+        for row in rows:
+            row["adjclose"] = None
 
     return rows
 
@@ -437,7 +465,7 @@ def annual_returns_from_rows(rows):
                 start_price, end_price = float(s), float(e)
                 break
 
-        if not start_price or not end_price or start_price <= 0:
+        if not start_price or not end_price or start_price <= 0 or end_price <= 0:
             continue
 
         returns_by_year[year] = end_price / start_price - 1
@@ -809,6 +837,26 @@ def check_allocation(
 # ============================================================
 # GET DATA
 # ============================================================
+
+def validate_stock_list(name, ticker_list):
+    """Stop with a clear message if a stock entry is malformed."""
+
+    for entry in ticker_list:
+        if (
+            not isinstance(entry, tuple)
+            or len(entry) < 2
+            or not isinstance(entry[0], str)
+            or not entry[0].strip()
+            or not isinstance(entry[1], (int, float))
+        ):
+            raise SystemExit(
+                f"{name} has an invalid entry: {entry!r}. Each entry must "
+                f'be ("TICKER", weight) or ("TICKER", weight, "Sector").'
+            )
+
+
+validate_stock_list("INITIAL_STOCKS_LIST", INITIAL_STOCKS_LIST)
+validate_stock_list("LATER_STOCKS_LIST", LATER_STOCKS_LIST)
 
 print(
     "Be patient. Getting ur data takes time..."
