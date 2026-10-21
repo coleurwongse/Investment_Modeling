@@ -22,9 +22,8 @@ LATER_PERCENT_S_AND_P = 0.45
 LATER_PERCENT_BONDS = 0.55
 LATER_PERCENT_ASSETS = 0.0
 
-INITIAL_STOCKS_LIST = [("VT", 0.075), ("XLP", 0.06), ("IJH", 0.06), ("XLV", 0.045), ("XLF", 0.03), ("XLK", 0.03), ("QLYS", 0.018), ("SAP", 0.018), ("TSM", 0.018), ("DG", 0.006), ("URBN", 0.006), ("SN", 0.006), ("AYI", 0.018), ("IBEX", 0.018), ("PJT", 0.018), ("EVR", 0.018), ("VCTR", 0.018), ("AXIAY", 0.018), ("CRH", 0.018), ("RICFY", 0.036), ("RGEDF", 0.036), ("HRMV", 0.036), ("CWCO", 0.027), ("SBS", 0.027), ("", ), ]
+INITIAL_STOCKS_LIST = [("VT", 0.075), ("XLP", 0.06), ("IJH", 0.06), ("XLV", 0.045), ("XLF", 0.03), ("XLK", 0.03), ("QLYS", 0.018), ("SAP", 0.018), ("TSM", 0.018), ("DG", 0.006), ("URBN", 0.006), ("SN", 0.006), ("AYI", 0.018), ("IBEX", 0.018), ("PJT", 0.018), ("EVR", 0.018), ("VCTR", 0.018), ("AXIAY", 0.018), ("CRH", 0.018), ("RICFY", 0.036), ("RGEDF", 0.036), ("HRMY", 0.036), ("CWCO", 0.027), ("SBS", 0.027)]
 LATER_STOCKS_LIST = []
-
 
 # ============================================================
 # CONTRIBUTIONS / WITHDRAWALS
@@ -47,8 +46,16 @@ ANNUAL_WITHDRAWAL = 50000
 # The variable withdrawal is separate from the regular $50k payment,
 # which is always taken in 2033 as well. Amounts below are the
 # variable portion only.
-WITHDRAWAL_RETAINED_VALUE = 500000
-WITHDRAWAL_RETAINED_FLOOR_VALUE = 450000
+#
+# Kept amount: $460k in T-bills covers the nine $50k payments for
+# 2034-2042 with no failures in 200,000 simulated T-bill paths (median
+# ~$136k left in 2042). Going below ~$420k starts to risk running out
+# if rates fall. Lowering it by $X raises the variable withdrawal by $X.
+WITHDRAWAL_RETAINED_VALUE = 460000
+
+# Must be exactly $50k (one regular payment) below the kept amount, or
+# the variable withdrawal can go negative for balances just above it.
+WITHDRAWAL_RETAINED_FLOOR_VALUE = WITHDRAWAL_RETAINED_VALUE - ANNUAL_WITHDRAWAL
 WITHDRAWAL_TARGET_VALUE = 500000
 WITHDRAWAL_LARGE_AMOUNT = 200000
 WITHDRAWAL_STANDARD_AMOUNT = 100000
@@ -69,21 +76,6 @@ WITHDRAWAL_VERY_HEALTHY_VALUE = 700000
 # ============================================================
 # MODEL PARAMETERS
 # ============================================================
-
-# Long-run return toward which individual-stock historical
-# means are shrunk.
-STOCK_TARGET_RETURN = 0.08
-
-# 50% historical mean / 50% long-run target.
-STOCK_MEAN_SHRINKAGE = 0.50
-
-# Student-t degrees of freedom.
-# Lower = fatter tails.
-STOCK_T_DF = 5
-
-# Winsorization limits for historical stock returns.
-STOCK_LOWER_PERCENTILE = 0.05
-STOCK_UPPER_PERCENTILE = 0.95
 
 # ------------------------------------------------------------
 # S&P 500 model
@@ -248,6 +240,15 @@ def stock_returns_by_year(ticker):
 
     returns_by_year = annual_returns_from_rows(rows)
 
+    # stock_distribution_parameters needs 5 annual returns; with fewer
+    # it silently uses the defaults, so say so.
+    if rows and len(returns_by_year) < 5:
+        print(
+            f"WARNING: {ticker} has only {len(returns_by_year)} full years "
+            f"of price history; using default "
+            f"{STOCK_TARGET_RETURN:.0%} return / 25% volatility."
+        )
+
     _returns_by_year_cache[ticker] = returns_by_year
 
     return returns_by_year
@@ -298,6 +299,25 @@ def _yahoo_rows_with_adjclose(ticker, interval):
             "adjclose": adjclose,
         })
 
+    # A dividend-adjusted close is the close scaled down by past
+    # dividends, so it must be positive and no higher than the close.
+    # Yahoo's adjustment is occasionally corrupt (e.g. RGEDF has
+    # adjusted closes of -$4 billion); if so, use the plain closes.
+    corrupt = any(
+        row["adjclose"] is not None
+        and row["close"] is not None
+        and not 0 < row["adjclose"] <= row["close"] * 1.01
+        for row in rows
+    )
+
+    if corrupt:
+        print(
+            f"WARNING: {ticker} has invalid dividend-adjusted prices on "
+            f"Yahoo; using unadjusted closes (dividends not included)."
+        )
+        for row in rows:
+            row["adjclose"] = None
+
     return rows
 
 
@@ -311,9 +331,12 @@ def fetch_price_rows(ticker):
        carries ETFs; price-only, no dividend adjustment
     """
 
+    # Yahoo writes class shares as BRK-B rather than BRK.B.
+    yahoo_ticker = ticker.replace(".", "-")
+
     attempts = [
-        ("Yahoo daily", lambda: _yahoo_rows_with_adjclose(ticker, "1d")),
-        ("Yahoo monthly", lambda: _yahoo_rows_with_adjclose(ticker, "1mo")),
+        ("Yahoo daily", lambda: _yahoo_rows_with_adjclose(yahoo_ticker, "1d")),
+        ("Yahoo monthly", lambda: _yahoo_rows_with_adjclose(yahoo_ticker, "1mo")),
         ("CBOE", lambda: usstock.ohlcv_history(ticker).get("rows", [])),
     ]
 
@@ -441,7 +464,7 @@ def annual_returns_from_rows(rows):
                 start_price, end_price = float(s), float(e)
                 break
 
-        if not start_price or not end_price or start_price <= 0:
+        if not start_price or not end_price or start_price <= 0 or end_price <= 0:
             continue
 
         returns_by_year[year] = end_price / start_price - 1
@@ -813,6 +836,26 @@ def check_allocation(
 # ============================================================
 # GET DATA
 # ============================================================
+
+def validate_stock_list(name, ticker_list):
+    """Stop with a clear message if a stock entry is malformed."""
+
+    for entry in ticker_list:
+        if (
+            not isinstance(entry, tuple)
+            or len(entry) < 2
+            or not isinstance(entry[0], str)
+            or not entry[0].strip()
+            or not isinstance(entry[1], (int, float))
+        ):
+            raise SystemExit(
+                f"{name} has an invalid entry: {entry!r}. Each entry must "
+                f'be ("TICKER", weight) or ("TICKER", weight, "Sector").'
+            )
+
+
+validate_stock_list("INITIAL_STOCKS_LIST", INITIAL_STOCKS_LIST)
+validate_stock_list("LATER_STOCKS_LIST", LATER_STOCKS_LIST)
 
 print(
     "Be patient. Getting ur data takes time..."
@@ -1281,11 +1324,6 @@ def determine_later_allocation(
 
 NUM_SIMULATIONS = 1000
 
-num_worked = 0
-num_times = 0
-
-failure_count_by_year = defaultdict(int)
-
 tracked_years = [
     2027, 2028, 2029, 2030,
     2031, 2032, 2033, 2034,
@@ -1293,24 +1331,28 @@ tracked_years = [
     2039, 2040, 2041, 2042
 ]
 
-year_value_totals = {
-    year: 0.0
-    for year in tracked_years
-}
-
-final_values = []
-successful_final_values = []
-variable_withdrawal_values = []
-
 
 # ============================================================
-# RUN MONTE CARLO
+# ONE SIMULATED PATH
 # ============================================================
 
-for simulation in range(NUM_SIMULATIONS):
+def simulate_path(verbose=False):
+    """
+    Simulate one 2027-2042 path. The Monte Carlo below runs this
+    NUM_SIMULATIONS times; individual_simulation.py runs it once with
+    verbose=True to print every year.
+
+    Returns a dict with the year-end values, whether the path
+    succeeded, the year it failed (if any), and the 2033 decisions.
+    """
+
+    def log(message=""):
+        if verbose:
+            print(message)
 
     portfolio_value = 300000
     success = True
+    failure_year = None
 
     # Each Monte Carlo path gets its own evolving T-bill rate.
     tbill_rate = TBILL_INITIAL_RATE
@@ -1320,13 +1362,7 @@ for simulation in range(NUM_SIMULATIONS):
         for year in tracked_years
     }
 
-    # The 2033 variable withdrawal range is not allowed to use
-    # information from 2031-2032 future outcomes. It is established
-    # exactly at the beginning of 2031.
-    variable_withdrawal_low = None
-    variable_withdrawal_high = None
-    projected_2033_value = None
-    actual_variable_withdrawal = None
+    log(f"Beginning of 2027: ${portfolio_value:,.2f}")
 
     # --------------------------------------------------------
     # 2027
@@ -1338,7 +1374,8 @@ for simulation in range(NUM_SIMULATIONS):
         INITIAL_PERCENT_S_AND_P,
         INITIAL_PERCENT_BONDS,
         INITIAL_PERCENT_ASSETS,
-        tbill_rate
+        tbill_rate,
+        show_breakdown=verbose
     )
 
     portfolio_value *= (1 + annual_return)
@@ -1346,6 +1383,12 @@ for simulation in range(NUM_SIMULATIONS):
     portfolio_value += INITIAL_CONTRIBUTION
 
     simulation_values[2027] = portfolio_value
+
+    log(
+        f"End of 2027:  return {annual_return:+.2%}, "
+        f"+${INITIAL_CONTRIBUTION:,.0f} contribution -> "
+        f"${portfolio_value:,.2f}"
+    )
 
     # --------------------------------------------------------
     # 2028-2030
@@ -1367,12 +1410,21 @@ for simulation in range(NUM_SIMULATIONS):
         portfolio_value *= (1 + annual_return)
 
         simulation_values[current_year] = portfolio_value
+
+        log(
+            f"End of {current_year}:  return {annual_return:+.2%} -> "
+            f"${portfolio_value:,.2f}"
+        )
+
         current_year += 1
 
     # --------------------------------------------------------
     # Beginning of 2031: establish variable-withdrawal range
     # --------------------------------------------------------
 
+    # The 2033 variable withdrawal range is not allowed to use
+    # information from 2031-2032 future outcomes. It is established
+    # exactly at the beginning of 2031.
     (
         variable_withdrawal_low,
         variable_withdrawal_high,
@@ -1380,6 +1432,14 @@ for simulation in range(NUM_SIMULATIONS):
     ) = establish_variable_withdrawal_range(
         portfolio_value
     )
+
+    log()
+    log(
+        f"Beginning of 2031: projected 2033 value "
+        f"${projected_2033_value:,.0f}; allowed variable withdrawal "
+        f"${variable_withdrawal_low:,.0f} - ${variable_withdrawal_high:,.0f}"
+    )
+    log()
 
     # --------------------------------------------------------
     # 2031-2032
@@ -1401,6 +1461,12 @@ for simulation in range(NUM_SIMULATIONS):
         portfolio_value *= (1 + annual_return)
 
         simulation_values[current_year] = portfolio_value
+
+        log(
+            f"End of {current_year}:  return {annual_return:+.2%} -> "
+            f"${portfolio_value:,.2f}"
+        )
+
         current_year += 1
 
     # --------------------------------------------------------
@@ -1414,6 +1480,7 @@ for simulation in range(NUM_SIMULATIONS):
     # everything above the lower floor instead. Otherwise use the
     # tiered policy clamped to the range set in 2031.
     all_bonds_after_2033 = portfolio_value > WITHDRAWAL_RETAINED_VALUE
+    portfolio_2033 = portfolio_value
 
     if all_bonds_after_2033:
         if (
@@ -1436,7 +1503,19 @@ for simulation in range(NUM_SIMULATIONS):
             variable_withdrawal_high
         )
 
-    variable_withdrawal_values.append(actual_variable_withdrawal)
+    log()
+    log(f"Beginning of 2033: ${portfolio_value:,.2f}")
+    if all_bonds_after_2033:
+        log(
+            f"  Above ${WITHDRAWAL_RETAINED_VALUE:,.0f}: keeping "
+            f"${retained_value:,.0f} in T-bills for 2033-2042"
+        )
+    log(
+        f"  Variable withdrawal ${actual_variable_withdrawal:,.2f} "
+        f"+ regular ${ANNUAL_WITHDRAWAL:,.0f} = "
+        f"${actual_variable_withdrawal + ANNUAL_WITHDRAWAL:,.2f}"
+    )
+    log()
 
     # --------------------------------------------------------
     # 2033-2042
@@ -1457,10 +1536,14 @@ for simulation in range(NUM_SIMULATIONS):
 
         if portfolio_value <= current_withdrawal:
 
+            log(
+                f"Beginning of {current_year}: ${portfolio_value:,.2f} "
+                f"can't cover the ${current_withdrawal:,.0f} withdrawal"
+            )
+
             portfolio_value = 0
             success = False
-
-            failure_count_by_year[current_year] += 1
+            failure_year = current_year
 
             for year in tracked_years:
                 if year >= current_year:
@@ -1502,14 +1585,23 @@ for simulation in range(NUM_SIMULATIONS):
             tbill_rate
         )
 
+        individual_weight = sum(entry[1] for entry in later_stocks)
+        log(
+            f"{current_year}: withdraw ${current_withdrawal:,.0f} -> "
+            f"${portfolio_value:,.2f}; allocation S&P {later_sp:.0%} / "
+            f"stocks {individual_weight:.0%} / bonds {later_bonds:.0%} / "
+            f"other {later_assets:.0%}; return {annual_return:+.2%}"
+        )
+
         portfolio_value *= (1 + annual_return)
 
         if portfolio_value <= 0:
 
+            log(f"End of {current_year}: portfolio depleted")
+
             portfolio_value = 0
             success = False
-
-            failure_count_by_year[current_year] += 1
+            failure_year = current_year
 
             for year in tracked_years:
                 if year >= current_year:
@@ -1518,235 +1610,323 @@ for simulation in range(NUM_SIMULATIONS):
             break
 
         simulation_values[current_year] = portfolio_value
+
+        log(f"End of {current_year}:  ${portfolio_value:,.2f}")
+
         current_year += 1
 
-    # --------------------------------------------------------
-    # Yearly totals
-    # --------------------------------------------------------
-
-    for year in tracked_years:
-        year_value_totals[year] += simulation_values[year]
-
-    # --------------------------------------------------------
-    # Final values
-    # --------------------------------------------------------
-
-    final_value = simulation_values[2042]
-
-    final_values.append(final_value)
-
-    if success:
-
-        successful_final_values.append(final_value)
-        num_worked += 1
-
-    num_times += 1
-
-    # --------------------------------------------------------
-    # Progress
-    # --------------------------------------------------------
-
-    if num_times % 100 == 0 or num_times == NUM_SIMULATIONS:
-        print(
-            f"\rSimulation {num_times:,}/{NUM_SIMULATIONS:,} | "
-            f"success rate so far: {num_worked / num_times:.2%}",
-            end="",
-            flush=True
-        )
+    return {
+        "values": simulation_values,
+        "final_value": simulation_values[2042],
+        "success": success,
+        "failure_year": failure_year,
+        "variable_withdrawal": actual_variable_withdrawal,
+        "all_bonds_after_2033": all_bonds_after_2033,
+        "portfolio_2033": portfolio_2033,
+        "projected_2033": projected_2033_value,
+        "variable_withdrawal_range": (
+            variable_withdrawal_low,
+            variable_withdrawal_high
+        ),
+    }
 
 
 # ============================================================
-# FINAL RESULTS
+# RUN MONTE CARLO
 # ============================================================
 
-print()
-print()
+def main():
 
-print("=" * 70)
-print("FINAL MONTE CARLO RESULTS")
-print("=" * 70)
-print(
-    f"Average 2033 variable withdrawal: "
-    f"${statistics.mean(variable_withdrawal_values):,.0f}"
-)
-print(
-    f"Median 2033 variable withdrawal:  "
-    f"${statistics.median(variable_withdrawal_values):,.0f}"
-)
+    num_worked = 0
+    num_times = 0
 
-success_rate = (
-    num_worked
-    / num_times
-    * 100
-)
+    failure_count_by_year = defaultdict(int)
 
-print(
-    f"Simulations:       {num_times:,}"
-)
+    year_value_totals = {
+        year: 0.0
+        for year in tracked_years
+    }
 
-print(
-    f"Successful:        {num_worked:,}"
-)
+    final_values = []
+    successful_final_values = []
+    variable_withdrawal_values = []
+    went_all_bonds = []
+    portfolio_2033_values = []
 
-print(
-    f"Failed:            "
-    f"{num_times - num_worked:,}"
-)
+    for simulation in range(NUM_SIMULATIONS):
 
-print(
-    f"Success Rate:      "
-    f"{success_rate:.2f}%"
-)
+        path = simulate_path()
+
+        if path["failure_year"] is not None:
+            failure_count_by_year[path["failure_year"]] += 1
+
+        variable_withdrawal_values.append(path["variable_withdrawal"])
+        went_all_bonds.append(path["all_bonds_after_2033"])
+        portfolio_2033_values.append(path["portfolio_2033"])
+
+        for year in tracked_years:
+            year_value_totals[year] += path["values"][year]
+
+        final_values.append(path["final_value"])
+
+        if path["success"]:
+            successful_final_values.append(path["final_value"])
+            num_worked += 1
+
+        num_times += 1
+
+        # Progress
+        if num_times % 100 == 0 or num_times == NUM_SIMULATIONS:
+            print(
+                f"\rSimulation {num_times:,}/{NUM_SIMULATIONS:,} | "
+                f"success rate so far: {num_worked / num_times:.2%}",
+                end="",
+                flush=True
+            )
 
 
-# ============================================================
-# 2042 STATISTICS
-# ============================================================
+    # ============================================================
+    # FINAL RESULTS
+    # ============================================================
 
-print()
-print("=" * 70)
-print("2042 PORTFOLIO STATISTICS")
-print("=" * 70)
+    print()
+    print()
 
-average_final = statistics.mean(
-    final_values
-)
-
-median_final = statistics.median(
-    final_values
-)
-
-sorted_values = sorted(
-    final_values
-)
-
-p10 = sorted_values[
-    int(len(sorted_values) * 0.10)
-]
-
-p25 = sorted_values[
-    int(len(sorted_values) * 0.25)
-]
-
-p75 = sorted_values[
-    int(len(sorted_values) * 0.75)
-]
-
-p90 = sorted_values[
-    int(len(sorted_values) * 0.90)
-]
-
-maximum_final = max(
-    final_values
-)
-
-if successful_final_values:
-
-    average_successful = statistics.mean(
-        successful_final_values
+    print("=" * 70)
+    print("FINAL MONTE CARLO RESULTS")
+    print("=" * 70)
+    print(
+        f"Average 2033 variable withdrawal: "
+        f"${statistics.mean(variable_withdrawal_values):,.0f}"
+    )
+    print(
+        f"Median 2033 variable withdrawal:  "
+        f"${statistics.median(variable_withdrawal_values):,.0f}"
     )
 
-else:
+    success_rate = (
+        num_worked
+        / num_times
+        * 100
+    )
 
-    average_successful = 0
+    print(
+        f"Simulations:       {num_times:,}"
+    )
 
+    print(
+        f"Successful:        {num_worked:,}"
+    )
 
-print(
-    f"Average (all):        "
-    f"${average_final:,.2f}"
-)
+    print(
+        f"Failed:            "
+        f"{num_times - num_worked:,}"
+    )
 
-print(
-    f"Average (successful): "
-    f"${average_successful:,.2f}"
-)
-
-print(
-    f"Median:               "
-    f"${median_final:,.2f}"
-)
-
-print(
-    f"10th percentile:      "
-    f"${p10:,.2f}"
-)
-
-print(
-    f"25th percentile:      "
-    f"${p25:,.2f}"
-)
-
-print(
-    f"75th percentile:      "
-    f"${p75:,.2f}"
-)
-
-print(
-    f"90th percentile:      "
-    f"${p90:,.2f}"
-)
-
-print(
-    f"Maximum:              "
-    f"${maximum_final:,.2f}"
-)
+    print(
+        f"Success Rate:      "
+        f"{success_rate:.2f}%"
+    )
 
 
-# ============================================================
-# FAILURE YEARS
-# ============================================================
+    # ============================================================
+    # 2042 STATISTICS
+    # ============================================================
 
-print()
-print("=" * 70)
-print("FAILURES BY YEAR")
-print("=" * 70)
+    print()
+    print("=" * 70)
+    print("2042 PORTFOLIO STATISTICS")
+    print("=" * 70)
 
-if failure_count_by_year:
+    average_final = statistics.mean(
+        final_values
+    )
 
-    for year in sorted(
-        failure_count_by_year
-    ):
+    median_final = statistics.median(
+        final_values
+    )
 
-        count = failure_count_by_year[
-            year
-        ]
+    sorted_values = sorted(
+        final_values
+    )
 
-        percentage = (
-            count
+    p10 = sorted_values[
+        int(len(sorted_values) * 0.10)
+    ]
+
+    p25 = sorted_values[
+        int(len(sorted_values) * 0.25)
+    ]
+
+    p75 = sorted_values[
+        int(len(sorted_values) * 0.75)
+    ]
+
+    p90 = sorted_values[
+        int(len(sorted_values) * 0.90)
+    ]
+
+    maximum_final = max(
+        final_values
+    )
+
+    if successful_final_values:
+
+        average_successful = statistics.mean(
+            successful_final_values
+        )
+
+    else:
+
+        average_successful = 0
+
+
+    print(
+        f"Average (all):        "
+        f"${average_final:,.2f}"
+    )
+
+    print(
+        f"Average (successful): "
+        f"${average_successful:,.2f}"
+    )
+
+    print(
+        f"Median:               "
+        f"${median_final:,.2f}"
+    )
+
+    print(
+        f"10th percentile:      "
+        f"${p10:,.2f}"
+    )
+
+    print(
+        f"25th percentile:      "
+        f"${p25:,.2f}"
+    )
+
+    print(
+        f"75th percentile:      "
+        f"${p75:,.2f}"
+    )
+
+    print(
+        f"90th percentile:      "
+        f"${p90:,.2f}"
+    )
+
+    print(
+        f"Maximum:              "
+        f"${maximum_final:,.2f}"
+    )
+
+
+    # ============================================================
+    # FAILURE YEARS
+    # ============================================================
+
+    print()
+    print("=" * 70)
+    print("FAILURES BY YEAR")
+    print("=" * 70)
+
+    if failure_count_by_year:
+
+        for year in sorted(
+            failure_count_by_year
+        ):
+
+            count = failure_count_by_year[
+                year
+            ]
+
+            percentage = (
+                count
+                / num_times
+                * 100
+            )
+
+            print(
+                f"{year}: "
+                f"{count:,} failures "
+                f"({percentage:.2f}%)"
+            )
+
+    else:
+
+        print("No failures.")
+
+
+    # ============================================================
+    # AVERAGE PORTFOLIO VALUE BY YEAR
+    # ============================================================
+
+    print()
+    print("=" * 70)
+    print("AVERAGE PORTFOLIO VALUE BY YEAR")
+    print("=" * 70)
+
+    for year in tracked_years:
+
+        average_value = (
+            year_value_totals[year]
             / num_times
-            * 100
         )
 
         print(
             f"{year}: "
-            f"{count:,} failures "
-            f"({percentage:.2f}%)"
+            f"${average_value:,.2f}"
         )
 
-else:
-
-    print("No failures.")
+    print("=" * 70)
 
 
-# ============================================================
-# AVERAGE PORTFOLIO VALUE BY YEAR
-# ============================================================
+    # ============================================================
+    # WHERE THE 2042 OUTCOMES COME FROM
+    # ============================================================
+    # Paths above WITHDRAWAL_RETAINED_VALUE in 2033 pay out the excess and
+    # sit in T-bills, so they all end up near the same 2042 value. Paths at
+    # or below it are invested in stocks for 2033-2042, which is where both
+    # the big 2042 outcomes and almost all failures come from.
 
-print()
-print("=" * 70)
-print("AVERAGE PORTFOLIO VALUE BY YEAR")
-print("=" * 70)
+    bond_finals = [
+        f for f, b in zip(final_values, went_all_bonds) if b
+    ]
+    stock_finals = [
+        f for f, b in zip(final_values, went_all_bonds) if not b
+    ]
 
-for year in tracked_years:
+    sorted_2033 = sorted(portfolio_2033_values)
 
-    average_value = (
-        year_value_totals[year]
-        / num_times
-    )
-
+    print()
+    print("=" * 70)
+    print("2033 SPLIT")
+    print("=" * 70)
     print(
-        f"{year}: "
-        f"${average_value:,.2f}"
+        f"2033 balance (before withdrawal) 10th/50th/90th pct: "
+        f"${sorted_2033[len(sorted_2033) // 10]:,.0f} / "
+        f"${statistics.median(sorted_2033):,.0f} / "
+        f"${sorted_2033[9 * len(sorted_2033) // 10]:,.0f}"
     )
 
-print("=" * 70)
+    for label, group in (
+        (f"Above ${WITHDRAWAL_RETAINED_VALUE:,.0f} -> all T-bills", bond_finals),
+        (f"At/below ${WITHDRAWAL_RETAINED_VALUE:,.0f} -> stock/bond mix", stock_finals),
+    ):
+        if not group:
+            print(f"{label}: 0 paths")
+            continue
+        failures = sum(1 for f in group if f <= 0)
+        print(
+            f"{label}: {len(group) / len(final_values):.1%} of paths, "
+            f"avg 2042 ${statistics.mean(group):,.0f}, "
+            f"median ${statistics.median(group):,.0f}, "
+            f"failures {failures:,}"
+        )
+
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
