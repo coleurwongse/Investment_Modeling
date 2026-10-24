@@ -2,17 +2,17 @@
 Run ONE simulated 2027-2042 path and print every year.
 
 This uses the exact same portfolio, market models and withdrawal /
-allocation policy as monte_carlo_sim_portfolio.py (it calls that
+allocation policy as monte_carlo_sim_new_portfolio.py (it calls that
 file's simulate_path function), so a single run here is one of the
 paths the Monte Carlo averages over. Change the portfolio or policy
-in monte_carlo_sim_portfolio.py and this file follows automatically.
+in monte_carlo_sim_new_portfolio.py and this file follows automatically.
 """
 
 import random
 
 import numpy
 
-import monte_carlo_sim_portfolio as model
+import monte_carlo_sim_new_portfolio as model
 
 
 # ============================================================

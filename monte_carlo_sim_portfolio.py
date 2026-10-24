@@ -1,4 +1,4 @@
-from scipy.stats import t
+import numpy
 try:
     import usstock
 except ModuleNotFoundError:
@@ -22,8 +22,51 @@ LATER_PERCENT_S_AND_P = 0.45
 LATER_PERCENT_BONDS = 0.55
 LATER_PERCENT_ASSETS = 0.0
 
-INITIAL_STOCKS_LIST = [("VT", 0.075), ("XLP", 0.06), ("IJH", 0.06), ("XLV", 0.045), ("XLF", 0.03), ("XLK", 0.03), ("QLYS", 0.018), ("SAP", 0.018), ("TSM", 0.018), ("DG", 0.006), ("URBN", 0.006), ("SN", 0.006), ("AYI", 0.018), ("IBEX", 0.018), ("PJT", 0.018), ("EVR", 0.018), ("VCTR", 0.018), ("AXIAY", 0.018), ("CRH", 0.018), ("RICFY", 0.036), ("RGEDF", 0.036), ("HRMY", 0.036), ("CWCO", 0.027), ("SBS", 0.027)]
+INITIAL_STOCKS_LIST = [("XLK", 0.15 * 0.36), ("VGT", 0.15 * 0.36), ("XLE", 0.125 * 0.36), ("XOP", 0.125 * 0.36), ("XLB", 0.125 * 0.36), ("VAW", 0.125 * 0.36), ("XLF", 0.1 * 0.36), ("KRE", 0.1 * 0.36), ("GRMN", 0.0225), ("KO", 0.0225), ("NYT", 0.0225), ("DECK", 0.0225), ("LDOS", 0.022125), ("ACN", 0.022125), ("FSLR", 0.022125), ("INTU", 0.022125), ("CF", 0.022), ("GD", 0.022), ("MLI", 0.022), ("AMP", 0.015), ("PYPL", 0.015), ("SD", 0.021), ("NEM", 0.003), ("ASND", 0.0015)]
 LATER_STOCKS_LIST = []
+
+
+# ============================================================
+# MARKET SCENARIO (STRESS TEST)
+# ============================================================
+# Forces market conditions starting in SCENARIO_START_YEAR; every
+# other year stays random. Individual holdings follow the S&P 500
+# through their own correlation, so in a crash a broad ETF falls
+# nearly as much as the index and a low-correlation stock falls less.
+#
+#   "normal"        no override
+#   "recession"     S&P 500 -20% then -10%; the Fed cuts the T-bill
+#                   rate to 1.5%, then 0.5%, held low a third year
+#   "market_crash"  one 2008-style year: S&P 500 -40%
+#   "sector_crash"  holdings in CRASH_SECTORS lose 45%, then 20%;
+#                   the rest of the market stays random
+#
+# Timing matters: a crash just before 2033 lowers the 2033 balance (and
+# the variable withdrawal); after 2033 it only hits paths that stayed
+# invested in stocks. Low T-bill rates after 2033 hit every path.
+MARKET_SCENARIO = "normal"
+SCENARIO_START_YEAR = 2031
+
+# Yahoo sector names: "Technology", "Financial Services", "Healthcare",
+# "Energy", "Industrials", "Consumer Cyclical", "Consumer Defensive",
+# "Utilities", "Basic Materials", "Real Estate", "Communication Services"
+CRASH_SECTORS = ["Technology"]
+
+# Year-by-year overrides, starting at SCENARIO_START_YEAR.
+SCENARIOS = {
+    "normal": {},
+    "recession": {
+        "sp_returns": [-0.20, -0.10],
+        "tbill_rates": [0.015, 0.005, 0.005],
+    },
+    "market_crash": {
+        "sp_returns": [-0.40],
+    },
+    "sector_crash": {
+        "sector_returns": [-0.45, -0.20],
+    },
+}
+
 
 # ============================================================
 # CONTRIBUTIONS / WITHDRAWALS
@@ -124,15 +167,26 @@ STOCK_T_DF = 5
 # positive correlation without moving identically.
 STOCK_SECTOR_CORRELATION = 0.30
 
-# Correlation between individual stocks and the S&P 500. This is
-# replaced at startup by the average historical correlation of the
-# configured stocks with the S&P 500, capped so stocks never move in
-# lockstep with the index.
-STOCK_SP_CORRELATION = 0.0
-STOCK_MAX_SP_CORRELATION = 0.80
+# Each holding's correlation with the S&P 500 is its own historical
+# correlation (annual returns), calculated at startup and stored in
+# STOCK_SP_CORRELATIONS. A holding with fewer than
+# STOCK_MIN_CORRELATION_YEARS overlapping years (too few to measure
+# reliably) uses the average of the holdings that have enough history,
+# or STOCK_DEFAULT_SP_CORRELATION if none do. Capped so nothing moves
+# in perfect lockstep with the index.
+STOCK_SP_CORRELATIONS = {}
+STOCK_DEFAULT_SP_CORRELATION = 0.60
 
-# Minimum overlapping years needed to use a stock's correlation.
-STOCK_MIN_CORRELATION_YEARS = 5
+# Historical beta (how much the holding moved per 1% S&P 500 move),
+# from untrimmed annual returns. Used in stress-test years so a forced
+# crash hits each holding as hard as it historically fell with the
+# market (the normal model's volatility is measured after trimming the
+# extreme years, which understates crash-year moves). Same fallback
+# rules as the correlations.
+STOCK_SP_BETAS = {}
+STOCK_DEFAULT_SP_BETA = 1.0
+STOCK_MAX_SP_CORRELATION = 0.95
+STOCK_MIN_CORRELATION_YEARS = 10
 
 # If a stock tuple only has (ticker, weight), it uses this sector.
 DEFAULT_STOCK_SECTOR = "Other"
@@ -146,6 +200,22 @@ STOCK_SECTORS = {
     # "JPM": "Financials",
     # "XOM": "Energy",
     # "JNJ": "Healthcare",
+}
+
+# Holdings without a sector in their tuple or in STOCK_SECTORS get one
+# looked up at startup (used for sector shocks and sector crashes).
+AUTO_DETECT_SECTORS = True
+
+# Sector ETFs map to their sector directly (Yahoo has no sector for
+# funds). Broad funds such as VT or IJH stay in DEFAULT_STOCK_SECTOR.
+SECTOR_FUNDS = {
+    "XLK": "Technology", "VGT": "Technology",
+    "XLF": "Financial Services", "KRE": "Financial Services",
+    "XLV": "Healthcare", "XLE": "Energy", "XOP": "Energy",
+    "XLI": "Industrials", "XLY": "Consumer Cyclical",
+    "XLP": "Consumer Defensive", "XLU": "Utilities",
+    "XLB": "Basic Materials", "VAW": "Basic Materials",
+    "XLRE": "Real Estate", "XLC": "Communication Services",
 }
 
 # Winsorization limits for historical stock returns.
@@ -483,6 +553,15 @@ def _student_t_scale(std, df):
     return std * math.sqrt((df - 2) / df)
 
 
+def student_t(df, loc, scale):
+    """
+    One Student-t draw. Same distribution as scipy's
+    t.rvs(df=df, loc=loc, scale=scale) but ~45x faster, which matters
+    when simulating thousands of paths.
+    """
+    return loc + scale * numpy.random.standard_t(df)
+
+
 def simulated_sp_return():
     """
     Generate an S&P 500 annual return from a Student-t distribution
@@ -490,7 +569,7 @@ def simulated_sp_return():
     """
 
     return max(
-        t.rvs(
+        student_t(
             df=SP_T_DF,
             loc=SP_MEAN,
             scale=_student_t_scale(SP_STD, SP_T_DF)
@@ -513,7 +592,7 @@ def simulated_asset_return():
     """
 
     return max(
-        t.rvs(
+        student_t(
             df=GOLD_T_DF,
             loc=GOLD_MEAN,
             scale=_student_t_scale(GOLD_STD, GOLD_T_DF)
@@ -568,11 +647,34 @@ def get_stock_sector(stock_entry):
     )
 
 
+# Results of stock_distribution_parameters, keyed by the id() of the
+# historical-returns list (the list is stored too, so a reused id can't
+# return the wrong entry).
+_distribution_cache = {}
+
+
 def stock_distribution_parameters(historical_returns):
     """
     Calculate the stock's historical mean/std after winsorization
     and shrink its mean toward the long-run equity target.
+
+    Cached: the historical returns never change during a run, and
+    recomputing them for every holding, year and path took over 90%
+    of the simulation time.
     """
+
+    key = id(historical_returns)
+    cached = _distribution_cache.get(key)
+
+    if cached is not None and cached[0] is historical_returns:
+        return cached[1]
+
+    result = _uncached_stock_distribution_parameters(historical_returns)
+    _distribution_cache[key] = (historical_returns, result)
+    return result
+
+
+def _uncached_stock_distribution_parameters(historical_returns):
 
     if not historical_returns:
         return STOCK_TARGET_RETURN, 0.25
@@ -609,15 +711,16 @@ def stock_distribution_parameters(historical_returns):
 def simulated_individual_stock_return(
     historical_returns,
     sector_shock=0.0,
-    market_shock=0.0
+    market_shock=0.0,
+    sp_correlation=0.0
 ):
     """
     Generate one stock return.
 
     The stock retains its own historical mean/volatility. A shared
-    S&P 500 shock gives every stock a correlation of
-    STOCK_SP_CORRELATION with the index, and a common sector shock
-    adds extra correlation among stocks in the same sector.
+    S&P 500 shock gives the stock a correlation of sp_correlation with
+    the index, and a common sector shock adds extra correlation among
+    stocks in the same sector.
 
     sector_shock should be a standard-normal draw shared by every
     stock in the same sector for that simulated year.
@@ -630,7 +733,7 @@ def simulated_individual_stock_return(
 
     beta = max(
         -STOCK_MAX_SP_CORRELATION,
-        min(STOCK_SP_CORRELATION, STOCK_MAX_SP_CORRELATION)
+        min(sp_correlation, STOCK_MAX_SP_CORRELATION)
     )
 
     rho = max(
@@ -665,7 +768,7 @@ def simulated_individual_stock_return(
         STOCK_T_DF
     )
 
-    idio_component = t.rvs(
+    idio_component = student_t(
         df=STOCK_T_DF,
         loc=0.0,
         scale=idio_scale
@@ -692,10 +795,12 @@ def calculate_return(
     bonds,
     assets,
     tbill_rate,
-    show_breakdown=False
+    show_breakdown=False,
+    year=None
 ):
     """
-    Calculate one year's portfolio return.
+    Calculate one year's portfolio return. `year` applies the active
+    MARKET_SCENARIO's overrides for that year.
 
     Returns:
         (total_return, next_tbill_rate)
@@ -705,8 +810,13 @@ def calculate_return(
 
     # The S&P 500 return is drawn first so individual stocks can
     # share its shock.
-    sp_return = simulated_sp_return()
+    sp_override = scenario_value("sp_returns", year)
+    sp_return = (
+        simulated_sp_return() if sp_override is None else sp_override
+    )
     market_shock = (sp_return - SP_MEAN) / SP_STD
+
+    sector_override = scenario_value("sector_returns", year)
 
     # One common shock per sector per simulated year.
     sector_shocks = {}
@@ -718,11 +828,38 @@ def calculate_return(
         if sector not in sector_shocks:
             sector_shocks[sector] = random.gauss(0.0, 1.0)
 
-        simulated_return = simulated_individual_stock_return(
-            annual_returns[i],
-            sector_shocks[sector],
-            market_shock
+        ticker = ticker_list[i][0].upper()
+        correlation = STOCK_SP_CORRELATIONS.get(
+            ticker,
+            STOCK_DEFAULT_SP_CORRELATION
         )
+
+        if sp_override is None:
+            simulated_return = simulated_individual_stock_return(
+                annual_returns[i],
+                sector_shocks[sector],
+                market_shock,
+                correlation
+            )
+        else:
+            # Stress-test year: the holding moves with the forced S&P 500
+            # return by its historical beta, plus its usual stock-specific
+            # (sector + idiosyncratic) randomness.
+            mean, _ = stock_distribution_parameters(annual_returns[i])
+            stock_specific = simulated_individual_stock_return(
+                annual_returns[i],
+                sector_shocks[sector],
+                0.0,
+                correlation
+            ) - mean
+            simulated_return = max(
+                STOCK_SP_BETAS.get(ticker, STOCK_DEFAULT_SP_BETA) * sp_return
+                + stock_specific,
+                -1.0
+            )
+
+        if sector_override is not None and sector in CRASH_SECTORS:
+            simulated_return = sector_override
 
         individual_stock_return += (
             simulated_return * ticker_list[i][1]
@@ -738,6 +875,10 @@ def calculate_return(
     next_tbill_rate = simulated_tbill_return(
         tbill_rate
     )
+
+    rate_override = scenario_value("tbill_rates", year)
+    if rate_override is not None:
+        next_tbill_rate = rate_override
 
     asset_return = simulated_asset_return()
     asset_contribution = assets * asset_return
@@ -874,11 +1015,10 @@ later_annual_returns = stock_data(
 # STOCK / S&P 500 CORRELATION
 # ============================================================
 
-def average_sp_correlation(ticker_lists):
+def holding_sp_correlations(ticker_lists):
     """
-    Average historical correlation between each configured stock's
-    annual returns and the S&P 500's annual returns over the years
-    they overlap. Returns 0.0 when no usable stock is configured.
+    {ticker: correlation with the S&P 500} for every configured stock,
+    from annual returns over the years both have data.
     """
 
     tickers = sorted({
@@ -888,11 +1028,13 @@ def average_sp_correlation(ticker_lists):
     })
 
     if not tickers:
-        return 0.0
+        return {}
 
     sp_by_year = sp500_returns_by_year()
 
-    correlations = []
+    measured = {}
+    measured_betas = {}
+    overlap = {}
 
     for ticker in tickers:
 
@@ -901,54 +1043,155 @@ def average_sp_correlation(ticker_lists):
         shared_years = sorted(
             set(stock_by_year) & set(sp_by_year)
         )
+        overlap[ticker] = len(shared_years)
 
         if len(shared_years) < STOCK_MIN_CORRELATION_YEARS:
-            print(
-                f"{ticker}: only {len(shared_years)} years overlap "
-                f"with the S&P 500; excluded from correlation."
-            )
             continue
 
         stock_returns = [stock_by_year[year] for year in shared_years]
         sp_returns = [sp_by_year[year] for year in shared_years]
 
         try:
-            correlation = statistics.correlation(
-                stock_returns,
-                sp_returns
+            measured[ticker] = statistics.correlation(stock_returns, sp_returns)
+            measured_betas[ticker] = (
+                statistics.covariance(stock_returns, sp_returns)
+                / statistics.variance(sp_returns)
             )
         except statistics.StatisticsError:
             # One of the series is constant.
+            measured.pop(ticker, None)
             continue
 
-        print(
-            f"{ticker}: S&P 500 correlation {correlation:.3f} "
-            f"({len(shared_years)} years)"
+    # Holdings without enough history to measure get the average of
+    # the ones that have it.
+    if measured:
+        fallback = statistics.mean(measured.values())
+        fallback_beta = statistics.mean(measured_betas.values())
+        fallback_label = "average of measured holdings"
+    else:
+        fallback = STOCK_DEFAULT_SP_CORRELATION
+        fallback_beta = STOCK_DEFAULT_SP_BETA
+        fallback_label = "default"
+
+    correlations = {}
+
+    print()
+    print("STOCK / S&P 500 CORRELATIONS")
+    print("-" * 70)
+
+    for ticker in tickers:
+
+        if ticker in measured:
+            raw = measured[ticker]
+            STOCK_SP_BETAS[ticker] = measured_betas[ticker]
+            source = f"own, {overlap[ticker]} years"
+        else:
+            raw = fallback
+            STOCK_SP_BETAS[ticker] = fallback_beta
+            source = f"{fallback_label} (only {overlap[ticker]} years)"
+
+        correlations[ticker] = max(
+            -STOCK_MAX_SP_CORRELATION,
+            min(raw, STOCK_MAX_SP_CORRELATION)
         )
 
-        correlations.append(correlation)
+        capped = " (capped)" if correlations[ticker] != raw else ""
+        print(
+            f"{ticker:8s} corr {correlations[ticker]:6.3f}{capped}  "
+            f"beta {STOCK_SP_BETAS[ticker]:5.2f}  [{source}]"
+        )
 
-    if not correlations:
-        return 0.0
+    print("-" * 70)
 
-    return statistics.mean(correlations)
+    return correlations
 
 
-historical_sp_correlation = average_sp_correlation(
+STOCK_SP_CORRELATIONS = holding_sp_correlations(
     [INITIAL_STOCKS_LIST, LATER_STOCKS_LIST]
 )
 
-STOCK_SP_CORRELATION = max(
-    -STOCK_MAX_SP_CORRELATION,
-    min(historical_sp_correlation, STOCK_MAX_SP_CORRELATION)
-)
 
-if INITIAL_STOCKS_LIST or LATER_STOCKS_LIST:
-    print(
-        f"Average stock/S&P 500 correlation: "
-        f"{historical_sp_correlation:.3f} "
-        f"(using {STOCK_SP_CORRELATION:.3f})"
+def detect_sectors(ticker_lists):
+    """
+    Fill STOCK_SECTORS for holdings that don't specify a sector:
+    sector ETFs from SECTOR_FUNDS, stocks from Yahoo's profile.
+    """
+
+    for ticker_list in ticker_lists:
+        for entry in ticker_list:
+            ticker = entry[0].upper()
+
+            if (len(entry) >= 3 and entry[2]) or ticker in STOCK_SECTORS:
+                continue
+
+            sector = SECTOR_FUNDS.get(ticker)
+
+            if sector is None and usstock is not None:
+                try:
+                    profile = usstock.overview(
+                        ticker.replace(".", "-")
+                    ).get("assetProfile", {})
+                    sector = profile.get("sector")
+                except Exception:
+                    sector = None
+
+            STOCK_SECTORS[ticker] = sector or DEFAULT_STOCK_SECTOR
+
+
+def scenario_value(key, year):
+    """The active scenario's override for `key` in `year`, or None."""
+
+    if year is None:
+        return None
+
+    values = SCENARIOS[MARKET_SCENARIO].get(key, [])
+    index = year - SCENARIO_START_YEAR
+
+    if 0 <= index < len(values):
+        return values[index]
+
+    return None
+
+
+if AUTO_DETECT_SECTORS:
+    detect_sectors([INITIAL_STOCKS_LIST, LATER_STOCKS_LIST])
+
+holding_sectors = {
+    entry[0].upper(): get_stock_sector(entry)
+    for ticker_list in (INITIAL_STOCKS_LIST, LATER_STOCKS_LIST)
+    for entry in ticker_list
+}
+
+if holding_sectors:
+    print()
+    print("SECTORS")
+    print("-" * 70)
+    for ticker, sector in sorted(holding_sectors.items()):
+        print(f"{ticker:8s} {sector}")
+    print("-" * 70)
+
+if MARKET_SCENARIO not in SCENARIOS:
+    raise SystemExit(
+        f"MARKET_SCENARIO must be one of {sorted(SCENARIOS)}, "
+        f"not {MARKET_SCENARIO!r}."
     )
+
+if MARKET_SCENARIO != "normal":
+    print()
+    print("!" * 70)
+    print(f"STRESS TEST: {MARKET_SCENARIO} starting {SCENARIO_START_YEAR}")
+    for key, values in SCENARIOS[MARKET_SCENARIO].items():
+        print(f"  {key}: " + ", ".join(
+            f"{SCENARIO_START_YEAR + i}: {v:+.1%}" for i, v in enumerate(values)
+        ))
+    if MARKET_SCENARIO == "sector_crash":
+        hit = sorted(t for t, s in holding_sectors.items() if s in CRASH_SECTORS)
+        print(f"  sectors: {', '.join(CRASH_SECTORS)}")
+        print(f"  holdings hit: {', '.join(hit) if hit else 'NONE'}")
+        if not hit:
+            print("  WARNING: no holdings are in CRASH_SECTORS, so this "
+                  "scenario changes nothing.")
+    print("!" * 70)
 
 
 # ============================================================
@@ -1375,7 +1618,8 @@ def simulate_path(verbose=False):
         INITIAL_PERCENT_BONDS,
         INITIAL_PERCENT_ASSETS,
         tbill_rate,
-        show_breakdown=verbose
+        show_breakdown=verbose,
+        year=2027
     )
 
     portfolio_value *= (1 + annual_return)
@@ -1404,7 +1648,8 @@ def simulate_path(verbose=False):
             INITIAL_PERCENT_S_AND_P,
             INITIAL_PERCENT_BONDS,
             INITIAL_PERCENT_ASSETS,
-            tbill_rate
+            tbill_rate,
+            year=current_year
         )
 
         portfolio_value *= (1 + annual_return)
@@ -1455,7 +1700,8 @@ def simulate_path(verbose=False):
             INITIAL_PERCENT_S_AND_P,
             INITIAL_PERCENT_BONDS,
             INITIAL_PERCENT_ASSETS,
-            tbill_rate
+            tbill_rate,
+            year=current_year
         )
 
         portfolio_value *= (1 + annual_return)
@@ -1582,7 +1828,8 @@ def simulate_path(verbose=False):
             later_sp,
             later_bonds,
             later_assets,
-            tbill_rate
+            tbill_rate,
+            year=current_year
         )
 
         individual_weight = sum(entry[1] for entry in later_stocks)
