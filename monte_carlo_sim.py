@@ -1711,6 +1711,17 @@ def simulate_path(verbose=False):
         for year in tracked_years
     }
 
+    # Fraction of the portfolio in stocks (S&P 500 + individual stocks
+    # and funds) each year; None once the path has run out of money.
+    initial_stock_weight = INITIAL_PERCENT_S_AND_P + sum(
+        entry[1] for entry in INITIAL_STOCKS_LIST
+    )
+
+    stock_weights = {
+        year: initial_stock_weight if year < 2033 else None
+        for year in tracked_years
+    }
+
     log(f"Beginning of 2027: ${portfolio_value:,.2f}")
 
     # --------------------------------------------------------
@@ -1939,6 +1950,8 @@ def simulate_path(verbose=False):
         )
 
         individual_weight = sum(entry[1] for entry in later_stocks)
+        stock_weights[current_year] = later_sp + individual_weight
+
         log(
             f"{current_year}: withdraw ${current_withdrawal:,.0f} -> "
             f"${portfolio_value:,.2f}; allocation S&P {later_sp:.0%} / "
@@ -1970,6 +1983,7 @@ def simulate_path(verbose=False):
 
     return {
         "values": simulation_values,
+        "stock_weights": stock_weights,
         "final_value": simulation_values[2042],
         "success": success,
         "failure_year": failure_year,
@@ -2000,6 +2014,17 @@ def main():
         for year in tracked_years
     }
 
+    # Every path's value and stock weight for each year, for the graphs.
+    values_by_year = {
+        year: []
+        for year in tracked_years
+    }
+
+    stock_weights_by_year = {
+        year: []
+        for year in tracked_years
+    }
+
     final_values = []
     successful_final_values = []
     variable_withdrawal_values = []
@@ -2019,6 +2044,10 @@ def main():
 
         for year in tracked_years:
             year_value_totals[year] += path["values"][year]
+            values_by_year[year].append(path["values"][year])
+
+            if path["stock_weights"][year] is not None:
+                stock_weights_by_year[year].append(path["stock_weights"][year])
 
         final_values.append(path["final_value"])
 
@@ -2279,6 +2308,99 @@ def main():
         )
 
     print("=" * 70)
+
+    plot_results(values_by_year, stock_weights_by_year)
+
+
+# ============================================================
+# GRAPHS
+# ============================================================
+
+def plot_results(values_by_year, stock_weights_by_year):
+    """
+    Two line graphs by year: the 10th/50th/90th percentile portfolio
+    value, and the average percent of the portfolio in stocks (S&P 500
+    plus individual stocks and funds; the rest is bonds). Failed paths
+    count as $0 in the first graph and are left out of the second.
+    """
+
+    # Only needed here, so the optimizer can import this file without it.
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
+
+    years = list(tracked_years)
+
+    percentile_lines = [
+        (0.90, "90th percentile", "#104281"),
+        (0.50, "Median", "#2a78d6"),
+        (0.10, "10th percentile", "#86b6ef"),
+    ]
+
+    figure, (value_axis, stock_axis) = plt.subplots(
+        1, 2, figsize=(14, 5.5)
+    )
+
+    # --------------------------------------------------------
+    # Portfolio value percentiles
+    # --------------------------------------------------------
+
+    for percentile, label, color in percentile_lines:
+        line = [
+            percentile_value(values_by_year[year], percentile)
+            for year in years
+        ]
+
+        value_axis.plot(
+            years, line, color=color, linewidth=2,
+            marker="o", markersize=4, label=label
+        )
+
+        value_axis.annotate(
+            f"${line[-1] / 1000:,.0f}k", (years[-1], line[-1]),
+            xytext=(6, 0), textcoords="offset points",
+            va="center", fontsize=9, color="#52514e"
+        )
+
+    value_axis.set_title("Portfolio value by year", loc="left")
+    value_axis.set_ylabel("Portfolio value")
+    value_axis.yaxis.set_major_formatter(
+        FuncFormatter(lambda value, _: f"${value / 1000:,.0f}k")
+    )
+    value_axis.set_ylim(bottom=0)
+    value_axis.legend(frameon=False)
+
+    # --------------------------------------------------------
+    # Percent in stocks
+    # --------------------------------------------------------
+
+    stock_line = [
+        100 * statistics.mean(stock_weights_by_year[year])
+        if stock_weights_by_year[year] else float("nan")
+        for year in years
+    ]
+
+    stock_axis.plot(
+        years, stock_line, color="#2a78d6", linewidth=2,
+        marker="o", markersize=4
+    )
+
+    stock_axis.set_title(
+        "Average % of portfolio in stocks (rest in bonds)", loc="left"
+    )
+    stock_axis.set_ylabel("% in stocks")
+    stock_axis.set_ylim(0, 100)
+
+    for axis in (value_axis, stock_axis):
+        axis.set_xlabel("Year")
+        axis.set_xticks(years)
+        axis.tick_params(axis="x", rotation=45)
+        axis.grid(axis="y", color="#e5e4df", linewidth=0.8)
+        axis.set_axisbelow(True)
+        for side in ("top", "right"):
+            axis.spines[side].set_visible(False)
+
+    figure.tight_layout()
+    plt.show()
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """
 Find the withdrawal settings that give the highest average 2033
 variable withdrawal while keeping the success rate at or above
-TARGET_SUCCESS_RATE, for the portfolio in monte_carlo_sim_new_portfolio.py.
+TARGET_SUCCESS_RATE, for the portfolio in monte_carlo_sim_portfolio.py.
 
 Settings searched:
     WITHDRAWAL_RETAINED_VALUE   amount kept in T-bills from 2033 on;
@@ -17,7 +17,7 @@ winner is then re-checked on a fresh, larger set of paths and under
 the stress-test scenarios.
 
 This doesn't edit the simulation file; copy the recommended values
-into monte_carlo_sim_new_portfolio.py.
+into monte_carlo_sim_portfolio.py.
 """
 
 import random
@@ -25,7 +25,7 @@ import statistics
 
 import numpy
 
-import monte_carlo_sim_new_portfolio as model
+import monte_carlo_sim_portfolio as model
 
 
 # ============================================================

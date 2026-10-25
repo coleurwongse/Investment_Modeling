@@ -22,9 +22,8 @@ LATER_PERCENT_S_AND_P = 0.45
 LATER_PERCENT_BONDS = 0.55
 LATER_PERCENT_ASSETS = 0.0
 
-INITIAL_STOCKS_LIST = [("XLK", 0.15 * 0.36), ("VGT", 0.15 * 0.36), ("XLE", 0.125 * 0.36), ("XOP", 0.125 * 0.36), ("XLB", 0.125 * 0.36), ("VAW", 0.125 * 0.36), ("XLF", 0.1 * 0.36), ("KRE", 0.1 * 0.36), ("GRMN", 0.0225), ("KO", 0.0225), ("NYT", 0.0225), ("DECK", 0.0225), ("LDOS", 0.022125), ("ACN", 0.022125), ("FSLR", 0.022125), ("INTU", 0.022125), ("CF", 0.022), ("GD", 0.022), ("MLI", 0.022), ("AMP", 0.015), ("PYPL", 0.015), ("SD", 0.021), ("NEM", 0.003), ("ASND", 0.0015)]
+INITIAL_STOCKS_LIST = [("VT", 0.075), ("XLP", 0.06), ("IJH", 0.06), ("XLV", 0.045), ("XLF", 0.03), ("XLK", 0.03), ("QLYS", 0.018), ("SAP", 0.018), ("TSM", 0.018), ("DG", 0.006), ("URBN", 0.006), ("SN", 0.006), ("AYI", 0.018), ("IBEX", 0.018), ("PJT", 0.018), ("EVR", 0.018), ("VCTR", 0.018), ("AXIAY", 0.018), ("CRH", 0.018), ("RICFY", 0.036), ("RGEDF", 0.036), ("HRMY", 0.036), ("CWCO", 0.027), ("SBS", 0.027)]
 LATER_STOCKS_LIST = []
-
 
 # ============================================================
 # MARKET SCENARIO (STRESS TEST)
@@ -144,11 +143,14 @@ ANNUAL_WITHDRAWAL = 50000
 # which is always taken in 2033 as well. Amounts below are the
 # variable portion only.
 #
-# Kept amount: $460k in T-bills covers the nine $50k payments for
-# 2034-2042 with no failures in 200,000 simulated T-bill paths (median
-# ~$136k left in 2042). Going below ~$420k starts to risk running out
-# if rates fall. Lowering it by $X raises the variable withdrawal by $X.
-WITHDRAWAL_RETAINED_VALUE = 460000
+# Kept amount, set with optimize_withdrawal.py (Oct 2026): $400k is the
+# lowest value that keeps success at or above 95% in normal markets
+# (96.0%, mean variable withdrawal ~$276k vs ~$217k at $460k).
+# It sits on a cliff: $390k gives ~88% and $380k ~71%, because $400k of
+# T-bills only just covers the nine $50k payments at the model's 4.25%
+# long-run rate, so it is the first thing to fail if T-bill rates run
+# low after 2033. $420k (98.6%, ~$19k less withdrawal) leaves more room.
+WITHDRAWAL_RETAINED_VALUE = 400000
 
 # Must be exactly $50k (one regular payment) below the kept amount, or
 # the variable withdrawal can go negative for balances just above it.
@@ -1671,7 +1673,7 @@ def determine_later_allocation(
 # MONTE CARLO SETTINGS
 # ============================================================
 
-NUM_SIMULATIONS = 1000
+NUM_SIMULATIONS = 10000
 
 tracked_years = [
     2027, 2028, 2029, 2030,
@@ -1708,6 +1710,17 @@ def simulate_path(verbose=False):
 
     simulation_values = {
         year: 0.0
+        for year in tracked_years
+    }
+
+    # Fraction of the portfolio in stocks (S&P 500 + individual stocks
+    # and funds) each year; None once the path has run out of money.
+    initial_stock_weight = INITIAL_PERCENT_S_AND_P + sum(
+        entry[1] for entry in INITIAL_STOCKS_LIST
+    )
+
+    stock_weights = {
+        year: initial_stock_weight if year < 2033 else None
         for year in tracked_years
     }
 
@@ -1939,6 +1952,8 @@ def simulate_path(verbose=False):
         )
 
         individual_weight = sum(entry[1] for entry in later_stocks)
+        stock_weights[current_year] = later_sp + individual_weight
+
         log(
             f"{current_year}: withdraw ${current_withdrawal:,.0f} -> "
             f"${portfolio_value:,.2f}; allocation S&P {later_sp:.0%} / "
@@ -1970,6 +1985,7 @@ def simulate_path(verbose=False):
 
     return {
         "values": simulation_values,
+        "stock_weights": stock_weights,
         "final_value": simulation_values[2042],
         "success": success,
         "failure_year": failure_year,
@@ -2000,6 +2016,17 @@ def main():
         for year in tracked_years
     }
 
+    # Every path's value and stock weight for each year, for the graphs.
+    values_by_year = {
+        year: []
+        for year in tracked_years
+    }
+
+    stock_weights_by_year = {
+        year: []
+        for year in tracked_years
+    }
+
     final_values = []
     successful_final_values = []
     variable_withdrawal_values = []
@@ -2019,6 +2046,10 @@ def main():
 
         for year in tracked_years:
             year_value_totals[year] += path["values"][year]
+            values_by_year[year].append(path["values"][year])
+
+            if path["stock_weights"][year] is not None:
+                stock_weights_by_year[year].append(path["stock_weights"][year])
 
         final_values.append(path["final_value"])
 
@@ -2279,6 +2310,99 @@ def main():
         )
 
     print("=" * 70)
+
+    plot_results(values_by_year, stock_weights_by_year)
+
+
+# ============================================================
+# GRAPHS
+# ============================================================
+
+def plot_results(values_by_year, stock_weights_by_year):
+    """
+    Two line graphs by year: the 10th/50th/90th percentile portfolio
+    value, and the average percent of the portfolio in stocks (S&P 500
+    plus individual stocks and funds; the rest is bonds). Failed paths
+    count as $0 in the first graph and are left out of the second.
+    """
+
+    # Only needed here, so the optimizer can import this file without it.
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
+
+    years = list(tracked_years)
+
+    percentile_lines = [
+        (0.90, "90th percentile", "#104281"),
+        (0.50, "Median", "#2a78d6"),
+        (0.10, "10th percentile", "#86b6ef"),
+    ]
+
+    figure, (value_axis, stock_axis) = plt.subplots(
+        1, 2, figsize=(14, 5.5)
+    )
+
+    # --------------------------------------------------------
+    # Portfolio value percentiles
+    # --------------------------------------------------------
+
+    for percentile, label, color in percentile_lines:
+        line = [
+            percentile_value(values_by_year[year], percentile)
+            for year in years
+        ]
+
+        value_axis.plot(
+            years, line, color=color, linewidth=2,
+            marker="o", markersize=4, label=label
+        )
+
+        value_axis.annotate(
+            f"${line[-1] / 1000:,.0f}k", (years[-1], line[-1]),
+            xytext=(6, 0), textcoords="offset points",
+            va="center", fontsize=9, color="#52514e"
+        )
+
+    value_axis.set_title("Portfolio value by year", loc="left")
+    value_axis.set_ylabel("Portfolio value")
+    value_axis.yaxis.set_major_formatter(
+        FuncFormatter(lambda value, _: f"${value / 1000:,.0f}k")
+    )
+    value_axis.set_ylim(bottom=0)
+    value_axis.legend(frameon=False)
+
+    # --------------------------------------------------------
+    # Percent in stocks
+    # --------------------------------------------------------
+
+    stock_line = [
+        100 * statistics.mean(stock_weights_by_year[year])
+        if stock_weights_by_year[year] else float("nan")
+        for year in years
+    ]
+
+    stock_axis.plot(
+        years, stock_line, color="#2a78d6", linewidth=2,
+        marker="o", markersize=4
+    )
+
+    stock_axis.set_title(
+        "Average % of portfolio in stocks (rest in bonds)", loc="left"
+    )
+    stock_axis.set_ylabel("% in stocks")
+    stock_axis.set_ylim(0, 100)
+
+    for axis in (value_axis, stock_axis):
+        axis.set_xlabel("Year")
+        axis.set_xticks(years)
+        axis.tick_params(axis="x", rotation=45)
+        axis.grid(axis="y", color="#e5e4df", linewidth=0.8)
+        axis.set_axisbelow(True)
+        for side in ("top", "right"):
+            axis.spines[side].set_visible(False)
+
+    figure.tight_layout()
+    plt.show()
 
 
 if __name__ == "__main__":
