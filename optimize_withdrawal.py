@@ -57,10 +57,11 @@ CURRENT_STANDARD = model.WITHDRAWAL_STANDARD_AMOUNT
 
 # (scenario, start year) combinations reported for the winner.
 STRESS_TESTS = [
-    ("recession", 2031),
-    ("recession", 2033),
-    ("market_crash", 2032),
-    ("sector_crash", 2032),
+    ("oil_shock", 2032),
+    ("rate_spike", 2032),
+    ("banking_collapse", 2032),
+    ("banking_collapse", 2033),
+    ("hype_crash", 2032),
 ]
 
 
@@ -203,7 +204,7 @@ def main():
         s, m_, _ = evaluate(best["retained"], best["standard"], VERIFY_PATHS // 5,
                             VERIFY_SEED, scenario)
         so, mo, _ = evaluate(*original, VERIFY_PATHS // 5, VERIFY_SEED, scenario)
-        print(f"  {scenario[0]:13s} {scenario[1]}:  {s:6.2%} / ${m_:>9,.0f}"
+        print(f"  {scenario[0]:16s} {scenario[1]}:  {s:6.2%} / ${m_:>9,.0f}"
               f"    (current settings: {so:6.2%} / ${mo:>9,.0f})")
     print("=" * 70)
 

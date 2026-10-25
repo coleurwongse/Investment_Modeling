@@ -29,41 +29,95 @@ LATER_STOCKS_LIST = []
 # ============================================================
 # MARKET SCENARIO (STRESS TEST)
 # ============================================================
-# Forces market conditions starting in SCENARIO_START_YEAR; every
-# other year stays random. Individual holdings follow the S&P 500
-# through their own correlation, so in a crash a broad ETF falls
-# nearly as much as the index and a low-correlation stock falls less.
+# Makes markets worse for SCENARIO_LENGTH years starting in
+# SCENARIO_START_YEAR; every other year is normal. Returns stay random
+# (a stressed year can still come out positive), they are just drawn
+# from a worse, more volatile distribution.
 #
-#   "normal"        no override
-#   "recession"     S&P 500 -20% then -10%; the Fed cuts the T-bill
-#                   rate to 1.5%, then 0.5%, held low a third year
-#   "market_crash"  one 2008-style year: S&P 500 -40%
-#   "sector_crash"  holdings in CRASH_SECTORS lose 45%, then 20%;
-#                   the rest of the market stays random
+#   "normal"            no stress
+#   "oil_shock"         war or politics cuts off oil; fuel, shipping and
+#                       manufacturing costs squeeze every company.
+#                       Stocks -15% with 2x volatility. Inflation hits
+#                       bonds too, so stocks and bonds fall together
+#   "rate_spike"        inflation gets out of hand and the central bank
+#                       hikes hard; loans get expensive, hiring stops.
+#                       Stocks -13.5% with 1.5x volatility, bonds lose
+#                       value alongside them, T-bill rate jumps 3 points
+#   "banking_collapse"  a big bank / housing failure freezes lending, so
+#                       companies can't pay suppliers or payroll.
+#                       Stocks -30% with 2.5x volatility, and every risky
+#                       asset (stocks, bonds, gold) moves with the market
+#                       at the same high correlation: nothing escapes
+#   "hype_crash"        a hyped sector (HYPE_SECTORS) turns out not to
+#                       make money and collapses: -20% with 2x
+#                       volatility. Defensive sectors get +2%, the rest
+#                       of the market is left alone
+#
+# "Stocks -15%" means 15 points off the expected return (the S&P 500's
+# 11% becomes -4%). Individual holdings lose that times their historical
+# beta, so a low-beta stock falls less than a high-beta one.
 #
 # Timing matters: a crash just before 2033 lowers the 2033 balance (and
-# the variable withdrawal); after 2033 it only hits paths that stayed
-# invested in stocks. Low T-bill rates after 2033 hit every path.
+# the variable withdrawal); after 2033 stock losses only hit paths that
+# stayed invested in stocks, but bond losses hit every path.
 MARKET_SCENARIO = "normal"
 SCENARIO_START_YEAR = 2031
+SCENARIO_LENGTH = 1
 
 # Yahoo sector names: "Technology", "Financial Services", "Healthcare",
 # "Energy", "Industrials", "Consumer Cyclical", "Consumer Defensive",
 # "Utilities", "Basic Materials", "Real Estate", "Communication Services"
-CRASH_SECTORS = ["Technology"]
+HYPE_SECTORS = ["Technology"]
+DEFENSIVE_SECTORS = ["Healthcare", "Utilities", "Consumer Defensive"]
 
-# Year-by-year overrides, starting at SCENARIO_START_YEAR.
+# Share of the S&P 500 in HYPE_SECTORS (tech is roughly 30%). In a hype
+# crash the index only takes this share of the sector's drop.
+HYPE_SECTOR_SP_WEIGHT = 0.30
+
+# Normally the bond sleeve just earns the T-bill rate. In a stressed
+# year with a bond hit it also gets a random price move of this size,
+# correlated with the stock market.
+STRESS_BOND_STD = 0.06
+
+# Settings for each stressed year:
+#   stock_return_drop        subtracted from the S&P 500 mean (and from
+#                            holdings, times their beta)
+#   stock_vol_mult           multiplies stock volatility
+#   bond_return_drop         subtracted from the bond sleeve's return
+#   stock_bond_correlation   correlation of the bond move with stocks
+#   tbill_rate_jump          added to the next year's T-bill rate
+#   risky_asset_correlation  every holding, gold and bonds correlate
+#                            with the S&P 500 at this one value
+#   gold_return_drop         subtracted from the gold mean
+#   sector_return_drop       subtracted from HYPE_SECTORS holdings
+#   sector_vol_mult          multiplies HYPE_SECTORS volatility
+#   defensive_return_boost   added to DEFENSIVE_SECTORS holdings
 SCENARIOS = {
     "normal": {},
-    "recession": {
-        "sp_returns": [-0.20, -0.10],
-        "tbill_rates": [0.015, 0.005, 0.005],
+    "oil_shock": {
+        "stock_return_drop": 0.15,
+        "stock_vol_mult": 2.0,
+        "bond_return_drop": 0.05,
+        "stock_bond_correlation": 0.50,
     },
-    "market_crash": {
-        "sp_returns": [-0.40],
+    "rate_spike": {
+        "stock_return_drop": 0.135,
+        "stock_vol_mult": 1.5,
+        "bond_return_drop": 0.10,
+        "stock_bond_correlation": 0.50,
+        "tbill_rate_jump": 0.03,
     },
-    "sector_crash": {
-        "sector_returns": [-0.45, -0.20],
+    "banking_collapse": {
+        "stock_return_drop": 0.30,
+        "stock_vol_mult": 2.5,
+        "bond_return_drop": 0.05,
+        "risky_asset_correlation": 0.90,
+        "gold_return_drop": 0.15,
+    },
+    "hype_crash": {
+        "sector_return_drop": 0.20,
+        "sector_vol_mult": 2.0,
+        "defensive_return_boost": 0.02,
     },
 }
 
@@ -178,11 +232,9 @@ STOCK_SP_CORRELATIONS = {}
 STOCK_DEFAULT_SP_CORRELATION = 0.60
 
 # Historical beta (how much the holding moved per 1% S&P 500 move),
-# from untrimmed annual returns. Used in stress-test years so a forced
-# crash hits each holding as hard as it historically fell with the
-# market (the normal model's volatility is measured after trimming the
-# extreme years, which understates crash-year moves). Same fallback
-# rules as the correlations.
+# from untrimmed annual returns. Used in stress-test years to scale the
+# market's drop for each holding (a beta-1.5 stock loses 1.5x the
+# S&P 500's stock_return_drop). Same fallback rules as the correlations.
 STOCK_SP_BETAS = {}
 STOCK_DEFAULT_SP_BETA = 1.0
 STOCK_MAX_SP_CORRELATION = 0.95
@@ -562,17 +614,18 @@ def student_t(df, loc, scale):
     return loc + scale * numpy.random.standard_t(df)
 
 
-def simulated_sp_return():
+def simulated_sp_return(mean=SP_MEAN, std=SP_STD):
     """
-    Generate an S&P 500 annual return from a Student-t distribution
-    centered at 11% with a 19.4% standard deviation.
+    Generate an S&P 500 annual return from a Student-t distribution,
+    normally centered at 11% with a 19.4% standard deviation (stress
+    tests pass a lower mean and higher std).
     """
 
     return max(
         student_t(
             df=SP_T_DF,
-            loc=SP_MEAN,
-            scale=_student_t_scale(SP_STD, SP_T_DF)
+            loc=mean,
+            scale=_student_t_scale(std, SP_T_DF)
         ),
         -1.0
     )
@@ -582,22 +635,41 @@ def simulated_sp_return():
 # GOLD MODEL
 # ============================================================
 
-def simulated_asset_return():
+def simulated_asset_return(mean=GOLD_MEAN, market_shock=0.0, correlation=0.0):
     """
     Generate a gold annual return from a heavy-tailed Student-t
     distribution centered at 8%.
 
     Gold is intentionally more volatile and has heavier tails than
-    the S&P 500.
+    the S&P 500. Normally it is independent of the market; a stress
+    test can give it a correlation with that year's market_shock.
     """
 
+    own_shock = _student_t_scale(1.0, GOLD_T_DF) * student_t(
+        df=GOLD_T_DF,
+        loc=0.0,
+        scale=1.0
+    )
+
     return max(
-        student_t(
-            df=GOLD_T_DF,
-            loc=GOLD_MEAN,
-            scale=_student_t_scale(GOLD_STD, GOLD_T_DF)
-        ),
+        mean
+        + GOLD_STD * correlated_shock(market_shock, correlation, own_shock),
         -1.0
+    )
+
+
+def correlated_shock(market_shock, correlation, own_shock=None):
+    """
+    A unit-variance shock with the given correlation to market_shock.
+    own_shock is the independent part (a standard normal if omitted).
+    """
+
+    if own_shock is None:
+        own_shock = random.gauss(0.0, 1.0)
+
+    return (
+        correlation * market_shock
+        + math.sqrt(1.0 - correlation ** 2) * own_shock
     )
 
 
@@ -712,7 +784,9 @@ def simulated_individual_stock_return(
     historical_returns,
     sector_shock=0.0,
     market_shock=0.0,
-    sp_correlation=0.0
+    sp_correlation=0.0,
+    mean_shift=0.0,
+    vol_mult=1.0
 ):
     """
     Generate one stock return.
@@ -725,11 +799,16 @@ def simulated_individual_stock_return(
     sector_shock should be a standard-normal draw shared by every
     stock in the same sector for that simulated year.
     market_shock should be that year's standardized S&P 500 return.
+    Stress tests use mean_shift and vol_mult to move the stock's
+    mean and scale its volatility.
     """
 
     mean, historical_std = stock_distribution_parameters(
         historical_returns
     )
+
+    mean += mean_shift
+    historical_std *= vol_mult
 
     beta = max(
         -STOCK_MAX_SP_CORRELATION,
@@ -808,15 +887,24 @@ def calculate_return(
 
     individual_stock_return = 0.0
 
-    # The S&P 500 return is drawn first so individual stocks can
-    # share its shock.
-    sp_override = scenario_value("sp_returns", year)
-    sp_return = (
-        simulated_sp_return() if sp_override is None else sp_override
-    )
-    market_shock = (sp_return - SP_MEAN) / SP_STD
+    # Empty (no stress) unless `year` is a stress-test year.
+    stress = scenario_for_year(year)
 
-    sector_override = scenario_value("sector_returns", year)
+    stock_drop = stress.get("stock_return_drop", 0.0)
+    stock_vol = stress.get("stock_vol_mult", 1.0)
+    sector_drop = stress.get("sector_return_drop", 0.0)
+    sector_vol = stress.get("sector_vol_mult", 1.0)
+    risky_correlation = stress.get("risky_asset_correlation")
+
+    # The S&P 500 return is drawn first so individual stocks can
+    # share its shock. In a hype crash the index only feels the hyped
+    # sector's share of the drop and the extra volatility.
+    sp_mean = SP_MEAN - stock_drop - sector_drop * HYPE_SECTOR_SP_WEIGHT
+    sp_std = SP_STD * (
+        stock_vol + (sector_vol - 1.0) * HYPE_SECTOR_SP_WEIGHT
+    )
+    sp_return = simulated_sp_return(sp_mean, sp_std)
+    market_shock = (sp_return - sp_mean) / sp_std
 
     # One common shock per sector per simulated year.
     sector_shocks = {}
@@ -834,32 +922,31 @@ def calculate_return(
             STOCK_DEFAULT_SP_CORRELATION
         )
 
-        if sp_override is None:
-            simulated_return = simulated_individual_stock_return(
-                annual_returns[i],
-                sector_shocks[sector],
-                market_shock,
-                correlation
-            )
-        else:
-            # Stress-test year: the holding moves with the forced S&P 500
-            # return by its historical beta, plus its usual stock-specific
-            # (sector + idiosyncratic) randomness.
-            mean, _ = stock_distribution_parameters(annual_returns[i])
-            stock_specific = simulated_individual_stock_return(
-                annual_returns[i],
-                sector_shocks[sector],
-                0.0,
-                correlation
-            ) - mean
-            simulated_return = max(
-                STOCK_SP_BETAS.get(ticker, STOCK_DEFAULT_SP_BETA) * sp_return
-                + stock_specific,
-                -1.0
-            )
+        if risky_correlation is not None:
+            correlation = risky_correlation
 
-        if sector_override is not None and sector in CRASH_SECTORS:
-            simulated_return = sector_override
+        # Market-wide stress hits each holding by its beta; a hype
+        # crash hits only the hyped sector and lifts defensive ones.
+        mean_shift = -stock_drop * STOCK_SP_BETAS.get(
+            ticker,
+            STOCK_DEFAULT_SP_BETA
+        )
+        vol_mult = stock_vol
+
+        if sector in HYPE_SECTORS:
+            mean_shift -= sector_drop
+            vol_mult *= sector_vol
+        elif sector in DEFENSIVE_SECTORS:
+            mean_shift += stress.get("defensive_return_boost", 0.0)
+
+        simulated_return = simulated_individual_stock_return(
+            annual_returns[i],
+            sector_shocks[sector],
+            market_shock,
+            correlation,
+            mean_shift,
+            vol_mult
+        )
 
         individual_stock_return += (
             simulated_return * ticker_list[i][1]
@@ -870,17 +957,33 @@ def calculate_return(
     # T-bills earn the rate in effect at the start of the year (that's
     # the rate you lock in when you buy them). The rate then evolves
     # for next year.
-    bond_contribution = bonds * tbill_rate
+    bond_return = tbill_rate
+
+    bond_drop = stress.get("bond_return_drop", 0.0)
+    if bond_drop:
+        # Stress-test year: inflation / panic knocks bond prices down,
+        # moving with stocks instead of cushioning them.
+        bond_correlation = stress.get(
+            "stock_bond_correlation",
+            risky_correlation or 0.0
+        )
+        bond_return += (
+            -bond_drop
+            + STRESS_BOND_STD
+            * correlated_shock(market_shock, bond_correlation)
+        )
+
+    bond_contribution = bonds * bond_return
 
     next_tbill_rate = simulated_tbill_return(
         tbill_rate
+    ) + stress.get("tbill_rate_jump", 0.0)
+
+    asset_return = simulated_asset_return(
+        GOLD_MEAN - stress.get("gold_return_drop", 0.0),
+        market_shock,
+        risky_correlation or 0.0
     )
-
-    rate_override = scenario_value("tbill_rates", year)
-    if rate_override is not None:
-        next_tbill_rate = rate_override
-
-    asset_return = simulated_asset_return()
     asset_contribution = assets * asset_return
 
     total_return = (
@@ -1138,19 +1241,16 @@ def detect_sectors(ticker_lists):
             STOCK_SECTORS[ticker] = sector or DEFAULT_STOCK_SECTOR
 
 
-def scenario_value(key, year):
-    """The active scenario's override for `key` in `year`, or None."""
+def scenario_for_year(year):
+    """The active scenario's settings if `year` is stressed, else {}."""
 
-    if year is None:
-        return None
+    if (
+        year is None
+        or not SCENARIO_START_YEAR <= year < SCENARIO_START_YEAR + SCENARIO_LENGTH
+    ):
+        return {}
 
-    values = SCENARIOS[MARKET_SCENARIO].get(key, [])
-    index = year - SCENARIO_START_YEAR
-
-    if 0 <= index < len(values):
-        return values[index]
-
-    return None
+    return SCENARIOS[MARKET_SCENARIO]
 
 
 if AUTO_DETECT_SECTORS:
@@ -1179,18 +1279,24 @@ if MARKET_SCENARIO not in SCENARIOS:
 if MARKET_SCENARIO != "normal":
     print()
     print("!" * 70)
-    print(f"STRESS TEST: {MARKET_SCENARIO} starting {SCENARIO_START_YEAR}")
-    for key, values in SCENARIOS[MARKET_SCENARIO].items():
-        print(f"  {key}: " + ", ".join(
-            f"{SCENARIO_START_YEAR + i}: {v:+.1%}" for i, v in enumerate(values)
-        ))
-    if MARKET_SCENARIO == "sector_crash":
-        hit = sorted(t for t, s in holding_sectors.items() if s in CRASH_SECTORS)
-        print(f"  sectors: {', '.join(CRASH_SECTORS)}")
-        print(f"  holdings hit: {', '.join(hit) if hit else 'NONE'}")
-        if not hit:
-            print("  WARNING: no holdings are in CRASH_SECTORS, so this "
-                  "scenario changes nothing.")
+    last_year = SCENARIO_START_YEAR + SCENARIO_LENGTH - 1
+    years = (
+        f"{SCENARIO_START_YEAR}" if SCENARIO_LENGTH == 1
+        else f"{SCENARIO_START_YEAR}-{last_year}"
+    )
+    print(f"STRESS TEST: {MARKET_SCENARIO}, {years}")
+    for key, value in SCENARIOS[MARKET_SCENARIO].items():
+        print(f"  {key}: {value:g}")
+    if MARKET_SCENARIO == "hype_crash":
+        for label, sectors in (
+            ("hyped", HYPE_SECTORS),
+            ("defensive", DEFENSIVE_SECTORS),
+        ):
+            hit = sorted(t for t, s in holding_sectors.items() if s in sectors)
+            print(f"  {label} holdings ({', '.join(sectors)}): "
+                  f"{', '.join(hit) if hit else 'none'}")
+        print(f"  S&P 500 takes {HYPE_SECTOR_SP_WEIGHT:.0%} of the hyped "
+              f"sector's drop")
     print("!" * 70)
 
 
