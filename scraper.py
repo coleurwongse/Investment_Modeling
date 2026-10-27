@@ -25,7 +25,7 @@ from stock_metrics import (
     key_statistics,
     latest_prices,
     load_shared_data,
-    price_history,
+    price_histories,
     price_metrics,
     ratio_trend_metrics,
     sector_metrics,
@@ -75,12 +75,18 @@ COLUMNS = [
     "revenue_yoy_ttm_pct", "eps_yoy_ttm_pct", "fcf_yoy_ttm_pct",
     "operating_cash_flow_yoy_ttm_pct",
 
-    # Growth
+    # Growth. Return-based columns come in pairs: _no_div is price
+    # change only, _with_div includes reinvested dividends.
     "revenue_cagr_pct", "revenue_cagr_years",
-    "price_cagr_3y_pct", "price_cagr_5y_pct", "price_cagr_10y_pct",
+    "cagr_3y_pct_no_div", "cagr_3y_pct_with_div",
+    "cagr_5y_pct_no_div", "cagr_5y_pct_with_div",
+    "cagr_10y_pct_no_div", "cagr_10y_pct_with_div",
 
     # Sector
-    "sector_etf", "sector_cagr_5y_pct", "relative_sector_cagr_5y_pct",
+    "sector_etf",
+    "sector_cagr_5y_pct_no_div", "sector_cagr_5y_pct_with_div",
+    "relative_sector_cagr_5y_pct_no_div",
+    "relative_sector_cagr_5y_pct_with_div",
     "industry_market_cap_share_pct",
 
     # Margins
@@ -93,9 +99,11 @@ COLUMNS = [
     "ebitda_margin_pct",
 
     # Risk / return
-    "beta_5y", "sharpe_5y", "downside_specific_volatility_pct",
-    "earnings_volatility", "return_1y_pct",
-    # return_<year>_pct columns are inserted here
+    "beta_5y", "sharpe_5y_no_div", "sharpe_5y_with_div",
+    "downside_specific_volatility_pct_no_div",
+    "downside_specific_volatility_pct_with_div",
+    "earnings_volatility", "return_1y_pct_no_div", "return_1y_pct_with_div",
+    # return_<year>_pct_<no_div/with_div> columns are inserted here
 
     # Financial health
     "altman_z", "piotroski_f", "interest_coverage",
@@ -164,17 +172,20 @@ def scrape_ticker(symbol, context, prices_now):
     row["sector"] = sector
     row["industry"] = industry
 
-    prices = attempt("price history", lambda: price_history(symbol))
-    if prices:
+    histories = attempt("price history", lambda: price_histories(symbol))
+    if histories:
+        if histories[1] is None:
+            errors.append(
+                "dividends: Yahoo's dividend-adjusted prices are missing "
+                "or invalid, so the _with_div columns are blank"
+            )
         row.update(attempt(
-            "price history", lambda: price_metrics(prices, context)
+            "price history", lambda: price_metrics(histories, context)
         ) or {})
 
     sector_row = attempt(
         "sector",
-        lambda: sector_metrics(
-            symbol, sector, industry, row.get("price_cagr_5y_pct"), context
-        )
+        lambda: sector_metrics(symbol, sector, industry, row, context)
     )
     if sector_row:
         row.update(sector_row)
@@ -195,7 +206,7 @@ def ordered_columns(rows):
         key for row in rows for key in row
         if key.startswith("return_") and key[7:11].isdigit()
     })
-    insert_at = COLUMNS.index("return_1y_pct") + 1
+    insert_at = COLUMNS.index("return_1y_pct_with_div") + 1
     return COLUMNS[:insert_at] + year_columns + COLUMNS[insert_at:]
 
 

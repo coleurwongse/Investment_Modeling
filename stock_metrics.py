@@ -19,6 +19,7 @@ import statistics
 import usstock
 from usstock import _http
 from usstock import _stockanalysis
+from usstock import _yahoo
 
 
 # ============================================================
@@ -359,12 +360,48 @@ def latest_prices(symbols, batch_size=20):
 
 def price_history(symbol):
     """[(date, close), ...] oldest first: 10 years of daily Yahoo closes."""
-    rows = usstock.chart(yahoo_symbol(symbol), "10y", "1d")["rows"]
-    return [
-        (dt.date.fromisoformat(row["date"][:10]), row["close"])
-        for row in rows
-        if row["close"]
-    ]
+    return price_histories(symbol)[0]
+
+
+def price_histories(symbol):
+    """
+    10 years of daily Yahoo prices as two [(date, price), ...] lists,
+    oldest first: plain closes (no dividends) and dividend-adjusted
+    closes (dividends reinvested).
+
+    usstock.chart() drops Yahoo's adjusted closes, so this reads the
+    chart data directly. The dividend list is None if Yahoo's
+    adjustment is missing or corrupt (an adjusted close must be
+    positive and no higher than the close; e.g. RGEDF has adjusted
+    closes of -$4 billion).
+    """
+    result = _yahoo._chart(yahoo_symbol(symbol), "10y", "1d")
+    rows = _yahoo._rows(result)
+    adjusted = (
+        ((result["indicators"].get("adjclose") or [{}])[0] or {})
+        .get("adjclose") or []
+    )
+
+    no_dividends = []
+    with_dividends = []
+
+    for i, row in enumerate(rows):
+        if not row["close"]:
+            continue
+        date = dt.date.fromisoformat(row["date"][:10])
+        adjusted_close = adjusted[i] if i < len(adjusted) else None
+
+        no_dividends.append((date, row["close"]))
+        with_dividends.append((date, adjusted_close))
+
+    if not all(
+        adjusted_close is not None
+        and 0 < adjusted_close <= close * 1.01
+        for (_, close), (_, adjusted_close) in zip(no_dividends, with_dividends)
+    ):
+        with_dividends = None
+
+    return no_dividends, with_dividends
 
 
 def sp500_history():
@@ -561,13 +598,20 @@ class MarketContext:
         return self._risk_free
 
     def sector_cagr(self, sector, years=5):
-        """(ETF, CAGR) for the sector's benchmark ETF."""
+        """
+        (ETF, {"no_div": CAGR, "with_div": CAGR}) for the sector's
+        benchmark ETF; ETF is None if the sector has no benchmark.
+        """
         etf = SECTOR_ETFS.get(sector)
         if etf is None:
-            return None, None
+            return None, {"no_div": None, "with_div": None}
         key = (etf, years)
         if key not in self._sector_cagr:
-            self._sector_cagr[key] = cagr(price_history(etf), years)
+            no_dividends, with_dividends = price_histories(etf)
+            self._sector_cagr[key] = {
+                "no_div": cagr(no_dividends, years),
+                "with_div": cagr(with_dividends, years),
+            }
         return etf, self._sector_cagr[key]
 
 
@@ -857,47 +901,68 @@ def dcf_metrics(stats, income_data, cashflow_data, price, risk_free):
     return row
 
 
-def price_metrics(prices, context):
-    """Historical returns, CAGR, Sharpe and downside specific volatility."""
+def price_metrics(histories, context):
+    """
+    Historical returns, CAGR, Sharpe and downside specific volatility,
+    each twice: from plain closes (columns ending _no_div) and from
+    dividend-adjusted closes (_with_div). `histories` is the pair
+    returned by price_histories().
+    """
+    row = {}
+    for suffix, prices in zip(("no_div", "with_div"), histories):
+        row.update(return_metrics(prices or [], context, suffix))
+    return row
+
+
+def return_metrics(prices, context, suffix):
+    """price_metrics for one price series; every key ends in _suffix."""
     row = {
-        "return_1y_pct": as_percent(cagr(prices, 1)),
-        "price_cagr_3y_pct": as_percent(cagr(prices, 3)),
-        "price_cagr_5y_pct": as_percent(cagr(prices, 5)),
-        "price_cagr_10y_pct": as_percent(cagr(prices, 10)),
+        f"return_1y_pct_{suffix}": as_percent(cagr(prices, 1)),
+        f"cagr_3y_pct_{suffix}": as_percent(cagr(prices, 3)),
+        f"cagr_5y_pct_{suffix}": as_percent(cagr(prices, 5)),
+        f"cagr_10y_pct_{suffix}": as_percent(cagr(prices, 10)),
     }
 
     yearly = calendar_year_returns(prices)
     for year in sorted(yearly)[-5:]:
-        row[f"return_{year}_pct"] = as_percent(yearly[year])
+        row[f"return_{year}_pct_{suffix}"] = as_percent(yearly[year])
 
     # A stock listed for less than the full window would otherwise get
-    # a "5-year" Sharpe ratio measured over a shorter period.
+    # a "5-year" Sharpe ratio measured over a shorter period. The S&P 500
+    # benchmark is the price index either way; its dividends barely move
+    # daily returns.
     if covers_years(prices, RISK_WINDOW_YEARS):
         daily = recent_daily_returns(prices)
-        row["sharpe_5y"] = sharpe_ratio(daily, context.risk_free)
-        row["downside_specific_volatility_pct"] = as_percent(
+        row[f"sharpe_5y_{suffix}"] = sharpe_ratio(daily, context.risk_free)
+        row[f"downside_specific_volatility_pct_{suffix}"] = as_percent(
             downside_specific_volatility(daily, context.sp500_returns)
         )
     else:
-        row["sharpe_5y"] = None
-        row["downside_specific_volatility_pct"] = None
+        row[f"sharpe_5y_{suffix}"] = None
+        row[f"downside_specific_volatility_pct_{suffix}"] = None
 
     return row
 
 
-def sector_metrics(symbol, sector, industry, stock_cagr_5y_pct, context):
-    """Sector benchmark growth, relative performance and industry share."""
-    etf, sector_cagr = context.sector_cagr(sector)
-    sector_cagr_pct = as_percent(sector_cagr)
+def sector_metrics(symbol, sector, industry, price_row, context):
+    """
+    Sector benchmark growth, relative performance and industry share.
+    price_row holds the stock's cagr_5y_pct_* columns from price_metrics.
+    """
+    etf, sector_cagrs = context.sector_cagr(sector)
+    row = {"sector_etf": etf}
 
-    return {
-        "sector_etf": etf,
-        "sector_cagr_5y_pct": sector_cagr_pct,
-        "relative_sector_cagr_5y_pct": (
-            stock_cagr_5y_pct - sector_cagr_pct
-            if stock_cagr_5y_pct is not None and sector_cagr_pct is not None
+    for suffix in ("no_div", "with_div"):
+        sector_cagr_pct = as_percent(sector_cagrs[suffix])
+        stock_cagr_pct = price_row.get(f"cagr_5y_pct_{suffix}")
+        row[f"sector_cagr_5y_pct_{suffix}"] = sector_cagr_pct
+        row[f"relative_sector_cagr_5y_pct_{suffix}"] = (
+            stock_cagr_pct - sector_cagr_pct
+            if stock_cagr_pct is not None and sector_cagr_pct is not None
             else None
-        ),
+        )
+
+    return row | {
         "industry_market_cap_share_pct": as_percent(
             context.industry_shares.get(symbol.upper())
         ),

@@ -26,7 +26,7 @@ from stock_metrics import (
     key_statistics,
     load_shared_data,
     latest_prices,
-    price_history,
+    price_histories,
     price_metrics,
     sector_metrics,
     valuation_and_health_metrics,
@@ -42,10 +42,15 @@ from stock_metrics import (
 
 MIN_PRICE = 5.0
 
-# 5-year annualized price return, in percent.
+# Return-based filters (CAGR, Sharpe, vs. sector) use returns without
+# dividends when False, or with reinvested dividends when True. The
+# output file shows both either way.
+FILTER_WITH_DIVIDENDS = True
+
+# 5-year annualized return, in percent.
 MIN_PRICE_CAGR_5Y_PCT = 8.0
 
-# 5-year price CAGR minus the sector ETF's 5-year CAGR, in
+# 5-year CAGR minus the sector ETF's 5-year CAGR, in
 # percentage points. 0 = must at least match its sector.
 MIN_RELATIVE_SECTOR_CAGR_PCT = 0.0
 
@@ -93,11 +98,17 @@ MAX_WORKERS = 6
 
 OUTPUT_COLUMNS = [
     "ticker", "name", "price", "sector", "industry", "market_cap",
-    "pe_ratio", "ev_ebitda", "beta_5y", "sharpe_5y",
-    "price_cagr_5y_pct", "sector_etf", "sector_cagr_5y_pct",
-    "relative_sector_cagr_5y_pct", "altman_z", "interest_coverage",
-    "debt_to_equity",
+    "pe_ratio", "ev_ebitda", "beta_5y",
+    "sharpe_5y_no_div", "sharpe_5y_with_div",
+    "cagr_5y_pct_no_div", "cagr_5y_pct_with_div", "sector_etf",
+    "sector_cagr_5y_pct_no_div", "sector_cagr_5y_pct_with_div",
+    "relative_sector_cagr_5y_pct_no_div",
+    "relative_sector_cagr_5y_pct_with_div",
+    "altman_z", "interest_coverage", "debt_to_equity",
 ]
+
+# Column suffix the return-based filters read.
+FILTER_SUFFIX = "with_div" if FILTER_WITH_DIVIDENDS else "no_div"
 
 
 # ============================================================
@@ -156,12 +167,15 @@ def sector_failure(sector):
 
 
 def performance_failure(row):
-    if not at_least(row.get("price_cagr_5y_pct"), MIN_PRICE_CAGR_5Y_PCT):
+    if not at_least(
+        row.get(f"cagr_5y_pct_{FILTER_SUFFIX}"), MIN_PRICE_CAGR_5Y_PCT
+    ):
         return "CAGR"
-    if not at_least(row.get("sharpe_5y"), MIN_SHARPE_5Y):
+    if not at_least(row.get(f"sharpe_5y_{FILTER_SUFFIX}"), MIN_SHARPE_5Y):
         return "Sharpe"
     if not at_least(
-        row.get("relative_sector_cagr_5y_pct"), MIN_RELATIVE_SECTOR_CAGR_PCT
+        row.get(f"relative_sector_cagr_5y_pct_{FILTER_SUFFIX}"),
+        MIN_RELATIVE_SECTOR_CAGR_PCT
     ):
         return "relative sector performance"
     return None
@@ -212,15 +226,14 @@ def check_sector(item):
 def check_performance(item, context):
     stock, row = item
     try:
-        prices = price_history(stock["symbol"])
+        histories = price_histories(stock["symbol"])
     except Exception:
         return stock, row, "no price history"
 
     try:
-        row.update(price_metrics(prices, context))
+        row.update(price_metrics(histories, context))
         row.update(sector_metrics(
-            stock["symbol"], row["sector"], row["industry"],
-            row.get("price_cagr_5y_pct"), context
+            stock["symbol"], row["sector"], row["industry"], row, context
         ))
     except Exception:
         # e.g. the sector ETF's prices failed to download.
@@ -295,7 +308,10 @@ def main():
             passed.append(row)
     print(f"   {len(passed):,} remain")
 
-    passed.sort(key=lambda row: row.get("sharpe_5y") or 0, reverse=True)
+    passed.sort(
+        key=lambda row: row.get(f"sharpe_5y_{FILTER_SUFFIX}") or 0,
+        reverse=True
+    )
 
     saved_to = write_csv(OUTPUT_FILE, OUTPUT_COLUMNS, passed)
 
@@ -308,7 +324,9 @@ def main():
 
     print()
     print("=" * 70)
-    print(f"{len(passed)} STOCKS PASSED (sorted by Sharpe ratio)")
+    dividends = "with" if FILTER_WITH_DIVIDENDS else "without"
+    print(f"{len(passed)} STOCKS PASSED (sorted by Sharpe ratio, "
+          f"returns {dividends} dividends)")
     print("=" * 70)
 
     def show(value, digits=1):
@@ -317,8 +335,8 @@ def main():
     for row in passed:
         print(
             f"{row['ticker']:8s} {(row['sector'] or ''):24s} "
-            f"CAGR {show(row.get('price_cagr_5y_pct')):>6s}%  "
-            f"Sharpe {show(row.get('sharpe_5y'), 2):>5s}  "
+            f"CAGR {show(row.get(f'cagr_5y_pct_{FILTER_SUFFIX}')):>6s}%  "
+            f"Sharpe {show(row.get(f'sharpe_5y_{FILTER_SUFFIX}'), 2):>5s}  "
             f"P/E {show(row['pe_ratio']):>6s}  "
             f"EV/EBITDA {show(row['ev_ebitda']):>6s}"
         )
