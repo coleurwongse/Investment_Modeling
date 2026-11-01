@@ -18,12 +18,16 @@ INITIAL_PERCENT_S_AND_P = 0.0
 INITIAL_PERCENT_BONDS = 0.30
 INITIAL_PERCENT_ASSETS = 0.0
 
-LATER_PERCENT_S_AND_P = 0.45
-LATER_PERCENT_BONDS = 0.55
-LATER_PERCENT_ASSETS = 0.0
-
 INITIAL_STOCKS_LIST = [("VEA", 0.05), ("JEPI", 0.25), ("WMT", 0.1), ("JPM", 0.1), ("XOM", 0.075), ("CVX", 0.075), ("PG", 0.05)]
-LATER_STOCKS_LIST = []
+
+# Phase 2 (2033-2042) holds the same investments in the same proportions
+# as phase 1. Only the stock-vs-bond split differs: for runs that stay
+# invested after 2033 it is set each year by determine_later_allocation
+# from what the remaining withdrawals need.
+LATER_PERCENT_S_AND_P = INITIAL_PERCENT_S_AND_P
+LATER_PERCENT_BONDS = INITIAL_PERCENT_BONDS
+LATER_PERCENT_ASSETS = INITIAL_PERCENT_ASSETS
+LATER_STOCKS_LIST = INITIAL_STOCKS_LIST
 
 # ============================================================
 # MARKET SCENARIO (STRESS TEST)
