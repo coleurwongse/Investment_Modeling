@@ -10,6 +10,7 @@ Every number comes from the usstock library:
     - US Treasury (risk-free rate) via usstock
 """
 
+import bisect
 import csv
 import datetime as dt
 import math
@@ -173,8 +174,27 @@ def as_percent(value):
     return None if value is None else value * 100
 
 
-def format_cell(value):
-    """CSV formatting: whole numbers for large values, 4 decimals otherwise."""
+LARGE_NUMBER_SUFFIXES = [(1e12, "t"), (1e9, "b"), (1e6, "m"), (1e3, "k")]
+
+
+def abbreviate_number(value):
+    """1234 -> "1.23k", 4.95e12 -> "4.95t" (two decimals)."""
+    for size, suffix in LARGE_NUMBER_SUFFIXES:
+        # Rounded first, so 999,999 becomes "1.00m" rather than "1000.00k".
+        if round(abs(value) / size, 2) >= 1:
+            return f"{value / size:.2f}{suffix}"
+    return f"{value:.4f}"
+
+
+def format_cell(value, abbreviate=False):
+    """
+    CSV formatting: whole numbers for large values, 4 decimals otherwise.
+    With abbreviate, numbers of 1,000 or more (either sign) are written
+    as k / m / b / t instead.
+    """
+    is_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+    if abbreviate and is_number and abs(value) >= 1000:
+        return abbreviate_number(value)
     if isinstance(value, float):
         if abs(value) >= 1e6:
             return f"{value:.0f}"
@@ -182,18 +202,20 @@ def format_cell(value):
     return "" if value is None else value
 
 
-def write_csv(path, columns, rows):
+def write_csv(path, columns, rows, abbreviate=False):
     """
     Write rows to a CSV and return the path used. If the file is open
     in Excel (locked on Windows), save to a timestamped copy instead of
-    losing the results.
+    losing the results. abbreviate writes large numbers as k / m / b / t.
     """
     def write(target):
         with open(target, "w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(file, fieldnames=columns, extrasaction="ignore")
             writer.writeheader()
             for row in rows:
-                writer.writerow({c: format_cell(row.get(c)) for c in columns})
+                writer.writerow({
+                    c: format_cell(row.get(c), abbreviate) for c in columns
+                })
 
     try:
         write(path)
@@ -422,6 +444,28 @@ def risk_free_rate():
     return curve["3 Mo"] / 100
 
 
+def risk_free_history(years=RISK_WINDOW_YEARS):
+    """
+    {date: 3-month Treasury yield as a decimal} for every trading day
+    from the start of the year `years` years ago through today.
+    """
+    this_year = dt.date.today().year
+    rates = {}
+
+    for year in range(this_year - years, this_year + 1):
+        try:
+            rows = usstock.treasury_yields(year)
+        except RuntimeError:
+            # Early January: no rates published for the new year yet.
+            continue
+        for row in rows:
+            if row.get("3 Mo") is not None:
+                date = dt.datetime.strptime(row["date"], "%m/%d/%Y").date()
+                rates[date] = row["3 Mo"] / 100
+
+    return rates
+
+
 # ============================================================
 # PRICE-BASED METRICS
 # ============================================================
@@ -483,14 +527,27 @@ def recent_daily_returns(prices, years=RISK_WINDOW_YEARS):
     return returns
 
 
-def sharpe_ratio(daily_returns, annual_risk_free):
-    """Annualized Sharpe ratio from daily returns."""
-    values = list(daily_returns.values())
-    if len(values) < TRADING_DAYS:
+def sharpe_ratio(daily_returns, risk_free_by_date):
+    """
+    Annualized Sharpe ratio from daily returns, net of the T-bill rate
+    in effect on each day (risk_free_by_date, from risk_free_history).
+
+    Using each day's rate matters: over 2021-2026 the 3-month yield went
+    from ~0% to over 5%, so subtracting today's rate from every day
+    understates the excess return of the early years.
+    """
+    if len(daily_returns) < TRADING_DAYS:
         return None
 
-    daily_risk_free = annual_risk_free / TRADING_DAYS
-    excess = [r - daily_risk_free for r in values]
+    # Days the Treasury didn't publish (bond-market holidays) use the
+    # most recent earlier rate.
+    rate_dates = sorted(risk_free_by_date)
+    excess = []
+    for date in sorted(daily_returns):
+        i = max(bisect.bisect_right(rate_dates, date) - 1, 0)
+        daily_risk_free = risk_free_by_date[rate_dates[i]] / TRADING_DAYS
+        excess.append(daily_returns[date] - daily_risk_free)
+
     std = statistics.stdev(excess)
     if std == 0:
         return None
@@ -571,6 +628,7 @@ class MarketContext:
         self._industry_shares = None
         self._sp500_returns = None
         self._risk_free = None
+        self._risk_free_history = None
         self._sector_cagr = {}
 
     @property
@@ -596,6 +654,12 @@ class MarketContext:
         if self._risk_free is None:
             self._risk_free = risk_free_rate()
         return self._risk_free
+
+    @property
+    def risk_free_history(self):
+        if self._risk_free_history is None:
+            self._risk_free_history = risk_free_history()
+        return self._risk_free_history
 
     def sector_cagr(self, sector, years=5):
         """
@@ -629,6 +693,8 @@ def load_shared_data(context, include_universe=False):
         if len(context.sp500_returns) < TRADING_DAYS * RISK_WINDOW_YEARS * 0.9:
             raise RuntimeError("S&P 500 price history is incomplete")
         _ = context.risk_free
+        if len(context.risk_free_history) < TRADING_DAYS * RISK_WINDOW_YEARS * 0.9:
+            raise RuntimeError("Treasury yield history is incomplete")
         if include_universe:
             _ = context.industry_shares
     except Exception as error:
@@ -933,7 +999,9 @@ def return_metrics(prices, context, suffix):
     # daily returns.
     if covers_years(prices, RISK_WINDOW_YEARS):
         daily = recent_daily_returns(prices)
-        row[f"sharpe_5y_{suffix}"] = sharpe_ratio(daily, context.risk_free)
+        row[f"sharpe_5y_{suffix}"] = sharpe_ratio(
+            daily, context.risk_free_history
+        )
         row[f"downside_specific_volatility_pct_{suffix}"] = as_percent(
             downside_specific_volatility(daily, context.sp500_returns)
         )

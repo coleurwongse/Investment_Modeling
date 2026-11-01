@@ -2,6 +2,10 @@
 Scrape fundamentals, risk and return metrics for a list of tickers
 and save them to scraped_data.csv.
 
+Numbers of 1,000 or more are written as k / m / b / t (e.g. 4.95t), and
+a "SECTOR AVG" row for each sector (the average of the scraped tickers
+in that sector) follows the companies.
+
 Usage:
     python scraper.py                 # uses TICKERS below
     python scraper.py AAPL MSFT JPM   # tickers from the command line
@@ -13,6 +17,7 @@ growth, decaying toward 3% terminal growth (settings in
 stock_metrics.py). Sector terminal growth isn't scraped.
 """
 
+import statistics
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -39,7 +44,77 @@ from stock_metrics import (
 # SETTINGS
 # ============================================================
 
-TICKERS = ["AAPL", "MSFT", "JPM"]
+TICKERS = [
+"JEPI",
+"O",
+"CLX",
+"AMCR",
+"HRL",
+"TROW",
+"KMB",
+"ES",
+"PEP",
+"KVUE",
+"FRT",
+"BEN",
+"MKC",
+"ESS",
+"SJM",
+"GPC",
+"SWK",
+"BF.B",
+"TGT",
+"CVX",
+"MCD",
+"ED",
+"MDT",
+"NEE",
+"PG",
+"IBM",
+"SYY",
+"ADM",
+"PPG",
+"LOW",
+"ITW",
+"AOS",
+"ABT",
+"ABBV",
+"ERIE",
+"APD",
+"ATO",
+"KO",
+"ADP",
+"CL",
+"XOM",
+"BDX",
+"CINF",
+"FAST",
+"AFL",
+"JNJ",
+"GD",
+"CHRW",
+"PNR",
+"ALB",
+"FDS",
+"EMR",
+"LIN",
+"CHD",
+"NDSN",
+"CB",
+"BRO",
+"DOV",
+"ECL",
+"SHW",
+"CTAS",
+"CAT",
+"SPGI",
+"ROP",
+"CAH",
+"WMT",
+"NUE",
+"EXPD",
+"GWW",
+"WST"]
 
 OUTPUT_FILE = "scraped_data.csv"
 
@@ -210,6 +285,44 @@ def ordered_columns(rows):
     return COLUMNS[:insert_at] + year_columns + COLUMNS[insert_at:]
 
 
+def sector_average_rows(rows, columns):
+    """
+    One row per sector with the average of every numeric column over the
+    scraped tickers in that sector (blanks are skipped, so each column
+    averages the tickers that have it). Tickers without a sector, such
+    as ETFs, aren't averaged.
+    """
+
+    by_sector = {}
+    for row in rows:
+        if row.get("sector"):
+            by_sector.setdefault(row["sector"], []).append(row)
+
+    averages = []
+    for sector in sorted(by_sector):
+        members = by_sector[sector]
+        average = {
+            "ticker": "SECTOR AVG",
+            "name": f"{sector} average ({len(members)} tickers)",
+            "sector": sector,
+        }
+
+        for column in columns:
+            if column in average:
+                continue
+            values = [
+                row[column] for row in members
+                if isinstance(row.get(column), (int, float))
+                and not isinstance(row.get(column), bool)
+            ]
+            if values:
+                average[column] = float(statistics.mean(values))
+
+        averages.append(average)
+
+    return averages
+
+
 def main():
     # stockanalysis writes class shares as BRK.B; accept BRK-B too.
     # dict.fromkeys drops duplicates but keeps the original order.
@@ -246,8 +359,16 @@ def main():
 
     columns = ordered_columns(rows)
 
-    saved_to = write_csv(OUTPUT_FILE, columns, rows)
-    print(f"Saved {len(rows)} rows to {saved_to}")
+    # Sector averages go below the companies, after a blank row.
+    averages = sector_average_rows(rows, columns)
+
+    saved_to = write_csv(
+        OUTPUT_FILE, columns, rows + [{}] + averages, abbreviate=True
+    )
+    print(
+        f"Saved {len(rows)} rows and {len(averages)} sector averages "
+        f"to {saved_to}"
+    )
 
 
 if __name__ == "__main__":
