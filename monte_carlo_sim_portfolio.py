@@ -202,6 +202,28 @@ TBILL_SIGMA = 0.12
 
 
 # ------------------------------------------------------------
+# Bond ladder
+# ------------------------------------------------------------
+# Before the withdrawals start, the bond sleeve holds Treasury notes
+# that mature at the end of NOTE_MATURITY_YEAR - 1 (just before the
+# 2033 variable withdrawal), so the yield is locked in for the whole
+# stretch. From NOTE_MATURITY_YEAR on it holds one-year T-bills, each
+# maturing just before the next $50k withdrawal.
+#
+# Notes are valued at market prices each year (as zero-coupon notes):
+# when rates rise they lose value and when rates fall they gain, but
+# money held to maturity earns exactly the yield it was bought at. New
+# money added when the portfolio is rebalanced buys at that year's
+# yield for the remaining term.
+NOTE_MATURITY_YEAR = 2033
+
+# A note's yield is the average T-bill rate expected over its life
+# (from the CIR model above) plus this much per year of maturity, so a
+# 6-year note pays about 0.6 points more than T-bills.
+NOTE_TERM_PREMIUM_PER_YEAR = 0.001
+
+
+# ------------------------------------------------------------
 # Gold model
 # ------------------------------------------------------------
 # Gold gets a Student-t distribution with substantially heavier
@@ -214,9 +236,13 @@ GOLD_T_DF = 4
 # ------------------------------------------------------------
 # Individual-stock model
 # ------------------------------------------------------------
+# Individual stocks are simulated in log space (lognormal): a year's
+# return can never fall to -100%, and big gains stay possible, which
+# matches how real stock returns are skewed. Each stock's arithmetic
+# mean/std targets below are converted so the simulated returns still
+# average out to them.
 STOCK_TARGET_RETURN = 0.08
 STOCK_MEAN_SHRINKAGE = 0.50
-STOCK_T_DF = 5
 
 # Fraction of each stock's non-market variance driven by its sector
 # factor. 0.30 means stocks in the same sector have meaningful extra
@@ -242,7 +268,9 @@ STOCK_DEFAULT_SP_BETA = 1.0
 STOCK_MAX_SP_CORRELATION = 0.95
 STOCK_MIN_CORRELATION_YEARS = 10
 
-# If a stock tuple only has (ticker, weight), it uses this sector.
+# A holding with no sector (none in its tuple or STOCK_SECTORS, and none
+# found online) gets its own group, e.g. "Other (VEA)", so unrelated
+# funds don't share a sector shock and move together for no reason.
 DEFAULT_STOCK_SECTOR = "Other"
 
 # Optional fallback sector map. Add tickers here if you do not
@@ -261,7 +289,7 @@ STOCK_SECTORS = {
 AUTO_DETECT_SECTORS = True
 
 # Sector ETFs map to their sector directly (Yahoo has no sector for
-# funds). Broad funds such as VT or IJH stay in DEFAULT_STOCK_SECTOR.
+# funds). Broad funds such as VT or IJH each get their own "Other" group.
 SECTOR_FUNDS = {
     "XLK": "Technology", "VGT": "Technology",
     "XLF": "Financial Services", "KRE": "Financial Services",
@@ -307,6 +335,42 @@ def simulated_tbill_return(current_rate):
     # Euler discretization can very occasionally step below zero.
     # T-bill rates cannot be negative in this model.
     return max(next_rate, 0.0)
+
+
+def note_yield(tbill_rate, years):
+    """
+    Annual yield on a Treasury note maturing in `years` years when the
+    T-bill rate is tbill_rate: the average T-bill rate the CIR model
+    expects over those years, plus the term premium.
+    """
+
+    expected_total = 0.0
+    rate = tbill_rate
+
+    for _ in range(years):
+        expected_total += rate
+        rate += TBILL_KAPPA * (TBILL_LONG_RUN_RATE - rate)
+
+    return expected_total / years + NOTE_TERM_PREMIUM_PER_YEAR * years
+
+
+def note_return(tbill_rate, next_tbill_rate, years):
+    """
+    One year's return on a zero-coupon note with `years` years left:
+    bought at this year's yield, valued a year later at next year's
+    yield for the remaining years - 1.
+    """
+
+    price_now = (1.0 + note_yield(tbill_rate, years)) ** -years
+
+    if years == 1:
+        return 1.0 / price_now - 1.0
+
+    price_next = (
+        1.0 + note_yield(next_tbill_rate, years - 1)
+    ) ** -(years - 1)
+
+    return price_next / price_now - 1.0
 
 
 # ============================================================
@@ -717,7 +781,7 @@ def get_stock_sector(stock_entry):
 
     return STOCK_SECTORS.get(
         ticker,
-        DEFAULT_STOCK_SECTOR
+        f"{DEFAULT_STOCK_SECTOR} ({ticker})"
     )
 
 
@@ -793,7 +857,8 @@ def simulated_individual_stock_return(
     """
     Generate one stock return.
 
-    The stock retains its own historical mean/volatility. A shared
+    The stock retains its own historical mean/volatility, simulated as
+    a lognormal return (see the individual-stock model settings). A shared
     S&P 500 shock gives the stock a correlation of sp_correlation with
     the index, and a common sector shock adds extra correlation among
     stocks in the same sector.
@@ -822,12 +887,17 @@ def simulated_individual_stock_return(
         min(STOCK_SECTOR_CORRELATION, 0.95)
     )
 
+    # Lognormal parameters with the same arithmetic mean and std:
+    #   1 + return = exp(log_mean + log_std * shock), shock ~ N(0, 1)
+    # A stress test can push the mean to -100% or below; keep the
+    # growth factor positive so the log is defined.
+    growth = max(1.0 + mean, 0.05)
+    log_variance = math.log(1.0 + (historical_std / growth) ** 2)
+    log_std = math.sqrt(log_variance)
+    log_mean = math.log(growth) - log_variance / 2.0
+
     # The market component accounts for beta^2 of variance.
-    market_component = (
-        beta
-        * historical_std
-        * market_shock
-    )
+    market_component = beta * market_shock
 
     # The sector and idiosyncratic components split the rest.
     non_market_variance = 1.0 - beta ** 2
@@ -835,39 +905,32 @@ def simulated_individual_stock_return(
     # The common sector component accounts for rho of that remainder.
     sector_component = (
         math.sqrt(rho * non_market_variance)
-        * historical_std
         * sector_shock
     )
 
-    # The idiosyncratic component gets the remaining variance.
-    idio_std = historical_std * math.sqrt(
-        (1.0 - rho) * non_market_variance
+    # The idiosyncratic component gets the remaining variance. It is
+    # normal rather than Student-t: heavy tails in log space produce
+    # absurd outliers (exp of a huge shock). Stocks still inherit the
+    # market's fat tails through market_shock.
+    idio_component = (
+        math.sqrt((1.0 - rho) * non_market_variance)
+        * random.gauss(0.0, 1.0)
     )
 
-    idio_scale = _student_t_scale(
-        idio_std,
-        STOCK_T_DF
-    )
+    shock = market_component + sector_component + idio_component
 
-    idio_component = student_t(
-        df=STOCK_T_DF,
-        loc=0.0,
-        scale=idio_scale
-    )
-
-    simulated_return = (
-        mean
-        + market_component
-        + sector_component
-        + idio_component
-    )
-
-    return max(simulated_return, -1.0)
+    return math.exp(log_mean + log_std * shock) - 1.0
 
 
 # ============================================================
 # PORTFOLIO RETURN
 # ============================================================
+
+# When set to a list (by the quarterly versions of this sim),
+# calculate_return appends each year's per-holding weights and returns
+# to it. None = record nothing (the normal case).
+RETURN_LOG = None
+
 
 def calculate_return(
     annual_returns,
@@ -911,6 +974,9 @@ def calculate_return(
     # One common shock per sector per simulated year.
     sector_shocks = {}
 
+    # Per-holding detail for RETURN_LOG.
+    holdings = []
+
     for i in range(len(ticker_list)):
 
         sector = get_stock_sector(ticker_list[i])
@@ -950,6 +1016,19 @@ def calculate_return(
             vol_mult
         )
 
+        if RETURN_LOG is not None:
+            stock_mean, stock_std = stock_distribution_parameters(
+                annual_returns[i]
+            )
+            holdings.append({
+                "weight": ticker_list[i][1],
+                "return": simulated_return,
+                "mean": stock_mean + mean_shift,
+                "std": stock_std * vol_mult,
+                "market_correlation": correlation,
+                "is_stock": True,
+            })
+
         individual_stock_return += (
             simulated_return * ticker_list[i][1]
         )
@@ -958,7 +1037,9 @@ def calculate_return(
 
     # T-bills earn the rate in effect at the start of the year (that's
     # the rate you lock in when you buy them). The rate then evolves
-    # for next year.
+    # for next year. Before NOTE_MATURITY_YEAR the bonds are notes
+    # instead (see the bond ladder settings); their return is set
+    # below, once next year's rate is known.
     bond_return = tbill_rate
 
     bond_drop = stress.get("bond_return_drop", 0.0)
@@ -975,11 +1056,18 @@ def calculate_return(
             * correlated_shock(market_shock, bond_correlation)
         )
 
-    bond_contribution = bonds * bond_return
-
     next_tbill_rate = simulated_tbill_return(
         tbill_rate
     ) + stress.get("tbill_rate_jump", 0.0)
+
+    if year is not None and year < NOTE_MATURITY_YEAR:
+        bond_return += note_return(
+            tbill_rate,
+            next_tbill_rate,
+            NOTE_MATURITY_YEAR - year
+        ) - tbill_rate
+
+    bond_contribution = bonds * bond_return
 
     asset_return = simulated_asset_return(
         GOLD_MEAN - stress.get("gold_return_drop", 0.0),
@@ -987,6 +1075,41 @@ def calculate_return(
         risky_correlation or 0.0
     )
     asset_contribution = assets * asset_return
+
+    if RETURN_LOG is not None:
+        RETURN_LOG.append({
+            "year": year,
+            "holdings": holdings + [
+                {
+                    "weight": stocks,
+                    "return": sp_return,
+                    "mean": sp_mean,
+                    "std": sp_std,
+                    "market_correlation": 1.0,
+                    "is_stock": True,
+                },
+                {
+                    # Smooth within the year unless a stress test
+                    # gives the bonds a price shock.
+                    "weight": bonds,
+                    "return": bond_return,
+                    "mean": bond_return,
+                    "std": STRESS_BOND_STD if bond_drop else 0.0,
+                    "market_correlation": (
+                        bond_correlation if bond_drop else 0.0
+                    ),
+                    "is_stock": False,
+                },
+                {
+                    "weight": assets,
+                    "return": asset_return,
+                    "mean": GOLD_MEAN - stress.get("gold_return_drop", 0.0),
+                    "std": GOLD_STD,
+                    "market_correlation": risky_correlation or 0.0,
+                    "is_stock": False,
+                },
+            ],
+        })
 
     total_return = (
         individual_stock_return
@@ -1010,7 +1133,7 @@ def calculate_return(
         )
 
         print(
-            f"T-bills:            "
+            f"Bonds:              "
             f"{bond_contribution * 100:.2f}%"
         )
 
@@ -1060,7 +1183,7 @@ def check_allocation(
     print("\n--- ALLOCATION CHECK ---")
 
     print(f"S&P 500:       {stocks:.2%}")
-    print(f"T-bills:       {bonds:.2%}")
+    print(f"Bonds:         {bonds:.2%}")
     print(f"Gold/other:     {assets:.2%}")
     print(f"Individual:    {stock_weight:.2%}")
     print(f"TOTAL:         {total:.2%}")
@@ -1240,7 +1363,8 @@ def detect_sectors(ticker_lists):
                 except Exception:
                     sector = None
 
-            STOCK_SECTORS[ticker] = sector or DEFAULT_STOCK_SECTOR
+            if sector:
+                STOCK_SECTORS[ticker] = sector
 
 
 def scenario_for_year(year):
@@ -1347,7 +1471,8 @@ def expected_initial_portfolio_return():
 
     return (
         INITIAL_PERCENT_S_AND_P * SP_MEAN
-        + INITIAL_PERCENT_BONDS * TBILL_LONG_RUN_RATE
+        # Seen from 2031, the notes have two years left.
+        + INITIAL_PERCENT_BONDS * note_yield(TBILL_LONG_RUN_RATE, 2)
         + INITIAL_PERCENT_ASSETS * GOLD_MEAN
         + individual_expected
     )
@@ -1724,11 +1849,17 @@ def simulate_path(verbose=False):
         for year in tracked_years
     }
 
+    # Value at the start of each year's returns (after that year's
+    # withdrawal), for the quarterly versions of this sim.
+    start_values = {}
+
     log(f"Beginning of 2027: ${portfolio_value:,.2f}")
 
     # --------------------------------------------------------
     # 2027
     # --------------------------------------------------------
+
+    start_values[2027] = portfolio_value
 
     annual_return, tbill_rate = calculate_return(
         initial_annual_returns,
@@ -1760,6 +1891,8 @@ def simulate_path(verbose=False):
     current_year = 2028
 
     for _ in range(3):
+
+        start_values[current_year] = portfolio_value
 
         annual_return, tbill_rate = calculate_return(
             initial_annual_returns,
@@ -1812,6 +1945,8 @@ def simulate_path(verbose=False):
     current_year = 2031
 
     for _ in range(2):
+
+        start_values[current_year] = portfolio_value
 
         annual_return, tbill_rate = calculate_return(
             initial_annual_returns,
@@ -1941,6 +2076,8 @@ def simulate_path(verbose=False):
 
         portfolio_value -= current_withdrawal
 
+        start_values[current_year] = portfolio_value
+
         annual_return, tbill_rate = calculate_return(
             later_annual_returns,
             later_stocks,
@@ -1986,6 +2123,7 @@ def simulate_path(verbose=False):
     return {
         "values": simulation_values,
         "stock_weights": stock_weights,
+        "start_values": start_values,
         "final_value": simulation_values[2042],
         "success": success,
         "failure_year": failure_year,

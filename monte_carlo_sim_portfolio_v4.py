@@ -202,6 +202,28 @@ TBILL_SIGMA = 0.12
 
 
 # ------------------------------------------------------------
+# Bond ladder
+# ------------------------------------------------------------
+# Before the withdrawals start, the bond sleeve holds Treasury notes
+# that mature at the end of NOTE_MATURITY_YEAR - 1 (just before the
+# 2033 variable withdrawal), so the yield is locked in for the whole
+# stretch. From NOTE_MATURITY_YEAR on it holds one-year T-bills, each
+# maturing just before the next $50k withdrawal.
+#
+# Notes are valued at market prices each year (as zero-coupon notes):
+# when rates rise they lose value and when rates fall they gain, but
+# money held to maturity earns exactly the yield it was bought at. New
+# money added when the portfolio is rebalanced buys at that year's
+# yield for the remaining term.
+NOTE_MATURITY_YEAR = 2033
+
+# A note's yield is the average T-bill rate expected over its life
+# (from the CIR model above) plus this much per year of maturity, so a
+# 6-year note pays about 0.6 points more than T-bills.
+NOTE_TERM_PREMIUM_PER_YEAR = 0.001
+
+
+# ------------------------------------------------------------
 # Gold model
 # ------------------------------------------------------------
 # Gold gets a Student-t distribution with substantially heavier
@@ -313,6 +335,42 @@ def simulated_tbill_return(current_rate):
     # Euler discretization can very occasionally step below zero.
     # T-bill rates cannot be negative in this model.
     return max(next_rate, 0.0)
+
+
+def note_yield(tbill_rate, years):
+    """
+    Annual yield on a Treasury note maturing in `years` years when the
+    T-bill rate is tbill_rate: the average T-bill rate the CIR model
+    expects over those years, plus the term premium.
+    """
+
+    expected_total = 0.0
+    rate = tbill_rate
+
+    for _ in range(years):
+        expected_total += rate
+        rate += TBILL_KAPPA * (TBILL_LONG_RUN_RATE - rate)
+
+    return expected_total / years + NOTE_TERM_PREMIUM_PER_YEAR * years
+
+
+def note_return(tbill_rate, next_tbill_rate, years):
+    """
+    One year's return on a zero-coupon note with `years` years left:
+    bought at this year's yield, valued a year later at next year's
+    yield for the remaining years - 1.
+    """
+
+    price_now = (1.0 + note_yield(tbill_rate, years)) ** -years
+
+    if years == 1:
+        return 1.0 / price_now - 1.0
+
+    price_next = (
+        1.0 + note_yield(next_tbill_rate, years - 1)
+    ) ** -(years - 1)
+
+    return price_next / price_now - 1.0
 
 
 # ============================================================
@@ -979,7 +1037,9 @@ def calculate_return(
 
     # T-bills earn the rate in effect at the start of the year (that's
     # the rate you lock in when you buy them). The rate then evolves
-    # for next year.
+    # for next year. Before NOTE_MATURITY_YEAR the bonds are notes
+    # instead (see the bond ladder settings); their return is set
+    # below, once next year's rate is known.
     bond_return = tbill_rate
 
     bond_drop = stress.get("bond_return_drop", 0.0)
@@ -996,11 +1056,18 @@ def calculate_return(
             * correlated_shock(market_shock, bond_correlation)
         )
 
-    bond_contribution = bonds * bond_return
-
     next_tbill_rate = simulated_tbill_return(
         tbill_rate
     ) + stress.get("tbill_rate_jump", 0.0)
+
+    if year is not None and year < NOTE_MATURITY_YEAR:
+        bond_return += note_return(
+            tbill_rate,
+            next_tbill_rate,
+            NOTE_MATURITY_YEAR - year
+        ) - tbill_rate
+
+    bond_contribution = bonds * bond_return
 
     asset_return = simulated_asset_return(
         GOLD_MEAN - stress.get("gold_return_drop", 0.0),
@@ -1022,8 +1089,8 @@ def calculate_return(
                     "is_stock": True,
                 },
                 {
-                    # T-bills only move within the year when a stress
-                    # test gives them a price shock.
+                    # Smooth within the year unless a stress test
+                    # gives the bonds a price shock.
                     "weight": bonds,
                     "return": bond_return,
                     "mean": bond_return,
@@ -1066,7 +1133,7 @@ def calculate_return(
         )
 
         print(
-            f"T-bills:            "
+            f"Bonds:              "
             f"{bond_contribution * 100:.2f}%"
         )
 
@@ -1116,7 +1183,7 @@ def check_allocation(
     print("\n--- ALLOCATION CHECK ---")
 
     print(f"S&P 500:       {stocks:.2%}")
-    print(f"T-bills:       {bonds:.2%}")
+    print(f"Bonds:         {bonds:.2%}")
     print(f"Gold/other:     {assets:.2%}")
     print(f"Individual:    {stock_weight:.2%}")
     print(f"TOTAL:         {total:.2%}")
@@ -1404,7 +1471,8 @@ def expected_initial_portfolio_return():
 
     return (
         INITIAL_PERCENT_S_AND_P * SP_MEAN
-        + INITIAL_PERCENT_BONDS * TBILL_LONG_RUN_RATE
+        # Seen from 2031, the notes have two years left.
+        + INITIAL_PERCENT_BONDS * note_yield(TBILL_LONG_RUN_RATE, 2)
         + INITIAL_PERCENT_ASSETS * GOLD_MEAN
         + individual_expected
     )
