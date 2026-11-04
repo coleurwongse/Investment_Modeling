@@ -57,7 +57,7 @@ print(
 print(
     f"2033-2042 allocation:  "
     + (
-        "all T-bills (above the retained value)"
+        "starts in T-bills, stocks only if it falls behind"
         if path["all_bonds_after_2033"]
         else "stock/bond mix adjusted each year"
     )

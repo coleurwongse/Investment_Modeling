@@ -138,10 +138,12 @@ ANNUAL_WITHDRAWAL = 50000
 # 2. At the beginning of 2033, calculate the withdrawal again
 #    using the actual portfolio, then clamp it to that range.
 # Exception: if the actual beginning-of-2033 portfolio is above
-# WITHDRAWAL_RETAINED_VALUE, everything above it is withdrawn and the
-# retained balance is moved entirely into bonds for 2033-2042. If that
+# WITHDRAWAL_RETAINED_VALUE, everything above it is withdrawn. If that
 # excess is smaller than the regular $50k payment, everything above
-# WITHDRAWAL_RETAINED_FLOOR_VALUE is withdrawn instead.
+# WITHDRAWAL_RETAINED_FLOOR_VALUE is withdrawn instead. The retained
+# balance starts in bonds, and is re-checked every year like any other
+# balance: if bonds alone fall behind the remaining payments, part of
+# it moves into stocks (see determine_later_allocation).
 #
 # The variable withdrawal is separate from the regular $50k payment,
 # which is always taken in 2033 as well. Amounts below are the
@@ -1772,6 +1774,10 @@ def determine_later_allocation(
 
         stock_weight = max(0.0, min(1.0, stock_weight))
 
+    # All bonds: no holdings to simulate.
+    if stock_weight == 0.0:
+        return 0.0, 1.0, 0.0, []
+
     # Keep the configured internal equity composition: every holding
     # in the stock sleeve is scaled by the same factor.
     scale = stock_weight / total_equity_baseline
@@ -1801,6 +1807,10 @@ def determine_later_allocation(
 # ============================================================
 # MONTE CARLO SETTINGS
 # ============================================================
+
+# Percentile spacing of the printed withdrawal table (the graph shows
+# every percentile from 0 to 100).
+WITHDRAWAL_PERCENTILE_TABLE_STEP = 5
 
 NUM_SIMULATIONS = 10000
 
@@ -1977,12 +1987,12 @@ def simulate_path(verbose=False):
     # Beginning of 2033: calculate variable withdrawal
     # --------------------------------------------------------
 
-    # Above the retained value: withdraw the excess and hold the
-    # remaining balance entirely in bonds. The regular 2033 $50k
-    # payment comes out of that excess, so the variable portion is
-    # whatever is left over. If the excess is under $50k, withdraw
-    # everything above the lower floor instead. Otherwise use the
-    # tiered policy clamped to the range set in 2031.
+    # Above the retained value: withdraw the excess, which leaves
+    # enough for bonds alone to fund the remaining payments. The
+    # regular 2033 $50k payment comes out of that excess, so the
+    # variable portion is whatever is left over. If the excess is
+    # under $50k, withdraw everything above the lower floor instead.
+    # Otherwise use the tiered policy clamped to the range set in 2031.
     all_bonds_after_2033 = portfolio_value > WITHDRAWAL_RETAINED_VALUE
     portfolio_2033 = portfolio_value
 
@@ -2012,7 +2022,7 @@ def simulate_path(verbose=False):
     if all_bonds_after_2033:
         log(
             f"  Above ${WITHDRAWAL_RETAINED_VALUE:,.0f}: keeping "
-            f"${retained_value:,.0f} in T-bills for 2033-2042"
+            f"${retained_value:,.0f} invested for 2033-2042"
         )
     log(
         f"  Variable withdrawal ${actual_variable_withdrawal:,.2f} "
@@ -2063,20 +2073,17 @@ def simulate_path(verbose=False):
             for _ in range(9 - j)
         ]
 
-        if all_bonds_after_2033:
-            later_sp, later_bonds, later_assets, later_stocks = (
-                0.0, 1.0, 0.0, []
-            )
-        else:
-            (
-                later_sp,
-                later_bonds,
-                later_assets,
-                later_stocks
-            ) = determine_later_allocation(
-                portfolio_value,
-                remaining_withdrawals
-            )
+        # Re-checked every year, so a run that falls behind (for
+        # example, T-bill rates stay low) can move into stocks in time.
+        (
+            later_sp,
+            later_bonds,
+            later_assets,
+            later_stocks
+        ) = determine_later_allocation(
+            portfolio_value,
+            remaining_withdrawals
+        )
 
         portfolio_value -= current_withdrawal
 
@@ -2412,9 +2419,10 @@ def main():
     # WHERE THE 2042 OUTCOMES COME FROM
     # ============================================================
     # Paths above WITHDRAWAL_RETAINED_VALUE in 2033 pay out the excess and
-    # sit in T-bills, so they all end up near the same 2042 value. Paths at
-    # or below it are invested in stocks for 2033-2042, which is where both
-    # the big 2042 outcomes and almost all failures come from.
+    # start in T-bills, moving into stocks only if they fall behind, so
+    # they end up near the same 2042 value. Paths at or below it are
+    # already short, so they hold stocks from the start, which is where
+    # the big 2042 outcomes come from.
 
     bond_finals = [
         f for f, b in zip(final_values, went_all_bonds) if b
@@ -2437,8 +2445,8 @@ def main():
     )
 
     for label, group in (
-        (f"Above ${WITHDRAWAL_RETAINED_VALUE:,.0f} -> all T-bills", bond_finals),
-        (f"At/below ${WITHDRAWAL_RETAINED_VALUE:,.0f} -> stock/bond mix", stock_finals),
+        (f"Above ${WITHDRAWAL_RETAINED_VALUE:,.0f} -> starts in T-bills", bond_finals),
+        (f"At/below ${WITHDRAWAL_RETAINED_VALUE:,.0f} -> starts in stock/bond mix", stock_finals),
     ):
         if not group:
             print(f"{label}: 0 paths")
@@ -2453,19 +2461,81 @@ def main():
 
     print("=" * 70)
 
-    plot_results(values_by_year, stock_weights_by_year)
+    print_withdrawal_percentiles(variable_withdrawal_values)
+
+    plot_results(
+        values_by_year,
+        stock_weights_by_year,
+        variable_withdrawal_values
+    )
+
+
+# ============================================================
+# 2033 WITHDRAWAL PERCENTILES
+# ============================================================
+
+def print_withdrawal_percentiles(withdrawals):
+    """
+    Print the 2033 variable withdrawal at each percentile of all runs
+    (including runs that fail later). Excludes the regular $50k.
+    """
+
+    print()
+    print("=" * 70)
+    print("2033 VARIABLE WITHDRAWAL BY PERCENTILE")
+    print("=" * 70)
+
+    for percentile in range(0, 101, WITHDRAWAL_PERCENTILE_TABLE_STEP):
+        value = percentile_value(withdrawals, percentile / 100)
+        print(f"{percentile:3d}th percentile: ${value:,.0f}")
+
+    print("=" * 70)
+
+
+def plot_withdrawal_percentiles(axis, withdrawals):
+    """Line graph of the 2033 variable withdrawal, percentiles 0-100."""
+
+    from matplotlib.ticker import FuncFormatter
+
+    percentiles = list(range(101))
+
+    axis.plot(
+        percentiles,
+        [percentile_value(withdrawals, p / 100) for p in percentiles],
+        color="#2a78d6",
+        linewidth=2
+    )
+
+    axis.set_title("2033 variable withdrawal by percentile", loc="left")
+    axis.set_xlabel("Percentile of runs")
+    axis.set_ylabel("Variable withdrawal (excludes the regular $50k)")
+    axis.yaxis.set_major_formatter(
+        FuncFormatter(lambda value, _: f"${value / 1000:,.0f}k")
+    )
+    axis.set_xlim(0, 100)
+    axis.set_xticks(range(0, 101, 10))
+    axis.set_ylim(bottom=0)
+    axis.grid(axis="y", color="#e5e4df", linewidth=0.8)
+    axis.set_axisbelow(True)
+    for side in ("top", "right"):
+        axis.spines[side].set_visible(False)
 
 
 # ============================================================
 # GRAPHS
 # ============================================================
 
-def plot_results(values_by_year, stock_weights_by_year):
+def plot_results(
+    values_by_year,
+    stock_weights_by_year,
+    variable_withdrawals
+):
     """
-    Two line graphs by year: the 10th/50th/90th percentile portfolio
-    value, and the average percent of the portfolio in stocks (S&P 500
-    plus individual stocks and funds; the rest is bonds). Failed paths
-    count as $0 in the first graph and are left out of the second.
+    Three line graphs: the 10th/50th/90th percentile portfolio value by
+    year, the average percent of the portfolio in stocks by year (S&P
+    500 plus individual stocks and funds; the rest is bonds), and the
+    2033 variable withdrawal by percentile. Failed paths count as $0 in
+    the first graph and are left out of the second.
     """
 
     # Only needed here, so the optimizer can import this file without it.
@@ -2480,8 +2550,8 @@ def plot_results(values_by_year, stock_weights_by_year):
         (0.10, "10th percentile", "#86b6ef"),
     ]
 
-    figure, (value_axis, stock_axis) = plt.subplots(
-        1, 2, figsize=(14, 5.5)
+    figure, (value_axis, stock_axis, withdrawal_axis) = plt.subplots(
+        1, 3, figsize=(20, 5.5)
     )
 
     # --------------------------------------------------------
@@ -2542,6 +2612,8 @@ def plot_results(values_by_year, stock_weights_by_year):
         axis.set_axisbelow(True)
         for side in ("top", "right"):
             axis.spines[side].set_visible(False)
+
+    plot_withdrawal_percentiles(withdrawal_axis, variable_withdrawals)
 
     figure.tight_layout()
     plt.show()
