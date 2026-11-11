@@ -38,6 +38,12 @@ LATER_STOCKS_LIST = INITIAL_STOCKS_LIST
 # (a stressed year can still come out positive), they are just drawn
 # from a worse, more volatile distribution.
 #
+# The volatility multipliers model panic: they widen losses only, so a
+# 2.5x multiplier makes bad years 2.5x as bad while good years keep
+# their normal size. Each stressed year's average return still drops by
+# exactly the stated amount. (Widening gains too made a crash year's
+# best case a several-hundred-fold gain.)
+#
 #   "normal"            no stress
 #   "oil_shock"         war or politics cuts off oil; fuel, shipping and
 #                       manufacturing costs squeeze every company.
@@ -86,7 +92,7 @@ STRESS_BOND_STD = 0.06
 # Settings for each stressed year:
 #   stock_return_drop        subtracted from the S&P 500 mean (and from
 #                            holdings, times their beta)
-#   stock_vol_mult           multiplies stock volatility
+#   stock_vol_mult           multiplies the size of stock losses
 #   bond_return_drop         subtracted from the bond sleeve's return
 #   stock_bond_correlation   correlation of the bond move with stocks
 #   tbill_rate_jump          added to the next year's T-bill rate
@@ -94,7 +100,7 @@ STRESS_BOND_STD = 0.06
 #                            with the S&P 500 at this one value
 #   gold_return_drop         subtracted from the gold mean
 #   sector_return_drop       subtracted from HYPE_SECTORS holdings
-#   sector_vol_mult          multiplies HYPE_SECTORS volatility
+#   sector_vol_mult          multiplies the size of HYPE_SECTORS losses
 #   defensive_return_boost   added to DEFENSIVE_SECTORS holdings
 SCENARIOS = {
     "normal": {},
@@ -189,6 +195,11 @@ SP_MEAN = 0.11
 SP_STD = 0.194
 SP_T_DF = 5
 
+# Part of the S&P 500's return paid as dividends (its yield is about
+# 1.2-1.3%). Only used to report where returns come from; the simulated
+# return is the same either way.
+SP_DIVIDEND_YIELD = 0.013
+
 
 # ------------------------------------------------------------
 # Treasury bill / CIR model
@@ -269,6 +280,14 @@ STOCK_DEFAULT_SP_CORRELATION = 0.60
 # S&P 500's stock_return_drop). Same fallback rules as the correlations.
 STOCK_SP_BETAS = {}
 STOCK_DEFAULT_SP_BETA = 1.0
+
+# Each holding's dividend yield: its total return (dividends reinvested)
+# minus its price-only return, averaged over the last
+# DIVIDEND_YIELD_YEARS complete years. Calculated at startup and stored
+# in STOCK_DIVIDEND_YIELDS. Only used to report where returns come
+# from; the simulated returns are the same either way.
+STOCK_DIVIDEND_YIELDS = {}
+DIVIDEND_YIELD_YEARS = 5
 STOCK_MAX_SP_CORRELATION = 0.95
 STOCK_MIN_CORRELATION_YEARS = 10
 
@@ -384,6 +403,10 @@ def note_return(tbill_rate, next_tbill_rate, years):
 # Annual returns keyed by year, cached per ticker so the S&P
 # correlation calculation does not download the same data twice.
 _returns_by_year_cache = {}
+
+# Same, from plain closes (price change only, no dividends), for the
+# dividend yields.
+_price_returns_by_year_cache = {}
 SP500_CACHE_KEY = "__SP500_INDEX__"
 
 
@@ -442,6 +465,9 @@ def stock_returns_by_year(ticker):
         )
 
     _returns_by_year_cache[ticker] = returns_by_year
+    _price_returns_by_year_cache[ticker] = annual_returns_from_rows(
+        rows, dividends=False
+    )
 
     return returns_by_year
 
@@ -580,10 +606,23 @@ def sp500_returns_by_year():
     return returns_by_year
 
 
-def _row_price(row):
-    """Dividend-adjusted close when available, otherwise the raw close."""
+def _price_keys(dividends=True):
+    """
+    Price fields to try, in order: dividend-adjusted closes first,
+    unless dividends is False (price change only).
+    """
+    if dividends:
+        return ("adjusted_close", "adjclose", "close")
+    return ("close",)
 
-    for key in ("adjusted_close", "adjclose", "close"):
+
+def _row_price(row, dividends=True):
+    """
+    Dividend-adjusted close when available, otherwise the raw close.
+    dividends=False always uses the raw close.
+    """
+
+    for key in _price_keys(dividends):
         value = row.get(key)
         if value is not None:
             try:
@@ -596,9 +635,11 @@ def _row_price(row):
     return None
 
 
-def annual_returns_from_rows(rows):
+def annual_returns_from_rows(rows, dividends=True):
     """
     Convert price rows into {year: year-end to year-end return}.
+    Returns include reinvested dividends when Yahoo provides
+    dividend-adjusted closes; dividends=False uses plain closes.
 
     - Uses the last row of each year that actually has a price, so a
       missing final-day price doesn't throw away the whole year.
@@ -618,7 +659,7 @@ def annual_returns_from_rows(rows):
     year_end = {}
 
     for row in rows:
-        price = _row_price(row)
+        price = _row_price(row, dividends)
 
         if price is None:
             continue
@@ -649,7 +690,7 @@ def annual_returns_from_rows(rows):
 
         # Pick one price field that both endpoints have.
         start_price = end_price = None
-        for key in ("adjusted_close", "adjclose", "close"):
+        for key in _price_keys(dividends):
             s = start_row.get(key)
             e = end_row.get(key)
             if s is not None and e is not None:
@@ -684,21 +725,115 @@ def student_t(df, loc, scale):
     return loc + scale * numpy.random.standard_t(df)
 
 
-def simulated_sp_return(mean=SP_MEAN, std=SP_STD):
+_STANDARD_NORMAL = statistics.NormalDist()
+
+
+def student_t_cdf(t_value, df):
     """
-    Generate an S&P 500 annual return from a Student-t distribution,
-    normally centered at 11% with a 19.4% standard deviation (stress
-    tests pass a lower mean and higher std).
+    P(T <= t_value) for a Student-t with a whole-number df, from the
+    closed-form series in Abramowitz & Stegun 26.7.3-4 (no scipy needed).
     """
 
-    return max(
-        student_t(
-            df=SP_T_DF,
-            loc=mean,
-            scale=_student_t_scale(std, SP_T_DF)
-        ),
-        -1.0
+    theta = math.atan(t_value / math.sqrt(df))
+    sin_t, cos_t = math.sin(theta), math.cos(theta)
+    series = 0.0
+
+    if df % 2:
+        term = cos_t
+        for j in range((df - 1) // 2):
+            series += term
+            term *= cos_t ** 2 * (2 * j + 2) / (2 * j + 3)
+        inside = 2.0 / math.pi * (theta + sin_t * series)
+    else:
+        term = 1.0
+        for j in range(df // 2):
+            series += term
+            term *= cos_t ** 2 * (2 * j + 1) / (2 * j + 2)
+        inside = sin_t * series
+
+    # inside = P(-t < T < t), signed like t_value.
+    return 0.5 + 0.5 * inside
+
+
+def normal_equivalent(market_shock):
+    """
+    The standard-normal shock at the same percentile as market_shock
+    (that year's standardized Student-t S&P 500 draw).
+
+    Stocks, bonds and gold move with the market through this rather
+    than the raw draw: a Student-t draw can be 6-8 standard deviations
+    in a rare year, and a lognormal stock return turns a shock that
+    size into a several-hundred-fold gain. The percentile (and so the
+    ranking of good and bad years) is unchanged.
+    """
+
+    raw_t = market_shock / _student_t_scale(1.0, SP_T_DF)
+    probability = min(max(student_t_cdf(raw_t, SP_T_DF), 1e-12), 1 - 1e-12)
+    return _STANDARD_NORMAL.inv_cdf(probability)
+
+
+def lognormal_return(mean, std, shock, downside_mult=1.0):
+    """
+    1 + return = exp(log_mean + log_std * shock) for a standard-normal
+    shock, with log_mean / log_std set so returns average `mean` with
+    standard deviation `std`. A return can never fall to -100%.
+
+    downside_mult (stress tests) widens only the losses: negative
+    shocks are multiplied by it, and log_mean is lowered so the
+    average return is still exactly `mean`.
+    """
+
+    # A stress test can push the mean to -100% or below; keep the
+    # growth factor positive so the log is defined.
+    growth = max(1.0 + mean, 0.05)
+    log_variance = math.log(1.0 + (std / growth) ** 2)
+    log_std = math.sqrt(log_variance)
+
+    if downside_mult == 1.0:
+        log_mean = math.log(growth) - log_variance / 2.0
+    else:
+        # E[exp(log_std * shock)] with losses widened: the two halves
+        # of the normal distribution, each in closed form.
+        widened = log_std * downside_mult
+        expected_growth = (
+            math.exp(widened ** 2 / 2.0) * _STANDARD_NORMAL.cdf(-widened)
+            + math.exp(log_variance / 2.0) * _STANDARD_NORMAL.cdf(log_std)
+        )
+        log_mean = math.log(growth) - math.log(expected_growth)
+
+        if shock < 0:
+            shock *= downside_mult
+
+    return math.exp(log_mean + log_std * shock) - 1.0
+
+
+def simulated_sp_return(mean=SP_MEAN, std=SP_STD, downside_mult=1.0,
+                        stressed=False):
+    """
+    Generate an S&P 500 annual return, normally from a Student-t
+    distribution centered at 11% with a 19.4% standard deviation.
+
+    In a stress-test year the same draw sets a lognormal return instead
+    (see lognormal_return), with the losses widened by downside_mult:
+    a widened Student-t would sometimes lose 100%.
+
+    Returns:
+        (sp_return, market_shock), where market_shock is the
+        standardized draw (mean 0, standard deviation 1).
+    """
+
+    market_shock = _student_t_scale(1.0, SP_T_DF) * numpy.random.standard_t(
+        SP_T_DF
     )
+
+    if stressed:
+        sp_return = lognormal_return(
+            mean, std, normal_equivalent(market_shock), downside_mult
+        )
+    else:
+        sp_return = max(mean + std * market_shock, -1.0)
+
+    return sp_return, market_shock
 
 
 # ============================================================
@@ -869,9 +1004,10 @@ def simulated_individual_stock_return(
 
     sector_shock should be a standard-normal draw shared by every
     stock in the same sector for that simulated year.
-    market_shock should be that year's standardized S&P 500 return.
-    Stress tests use mean_shift and vol_mult to move the stock's
-    mean and scale its volatility.
+    market_shock should be that year's market shock as a standard
+    normal (see normal_equivalent).
+    Stress tests use mean_shift to move the stock's mean and vol_mult
+    to widen its losses (see lognormal_return).
     """
 
     mean, historical_std = stock_distribution_parameters(
@@ -879,7 +1015,6 @@ def simulated_individual_stock_return(
     )
 
     mean += mean_shift
-    historical_std *= vol_mult
 
     beta = max(
         -STOCK_MAX_SP_CORRELATION,
@@ -890,15 +1025,6 @@ def simulated_individual_stock_return(
         0.0,
         min(STOCK_SECTOR_CORRELATION, 0.95)
     )
-
-    # Lognormal parameters with the same arithmetic mean and std:
-    #   1 + return = exp(log_mean + log_std * shock), shock ~ N(0, 1)
-    # A stress test can push the mean to -100% or below; keep the
-    # growth factor positive so the log is defined.
-    growth = max(1.0 + mean, 0.05)
-    log_variance = math.log(1.0 + (historical_std / growth) ** 2)
-    log_std = math.sqrt(log_variance)
-    log_mean = math.log(growth) - log_variance / 2.0
 
     # The market component accounts for beta^2 of variance.
     market_component = beta * market_shock
@@ -914,8 +1040,7 @@ def simulated_individual_stock_return(
 
     # The idiosyncratic component gets the remaining variance. It is
     # normal rather than Student-t: heavy tails in log space produce
-    # absurd outliers (exp of a huge shock). Stocks still inherit the
-    # market's fat tails through market_shock.
+    # absurd outliers (exp of a huge shock).
     idio_component = (
         math.sqrt((1.0 - rho) * non_market_variance)
         * random.gauss(0.0, 1.0)
@@ -923,7 +1048,7 @@ def simulated_individual_stock_return(
 
     shock = market_component + sector_component + idio_component
 
-    return math.exp(log_mean + log_std * shock) - 1.0
+    return lognormal_return(mean, historical_std, shock, vol_mult)
 
 
 # ============================================================
@@ -969,11 +1094,15 @@ def calculate_return(
     # share its shock. In a hype crash the index only feels the hyped
     # sector's share of the drop and the extra volatility.
     sp_mean = SP_MEAN - stock_drop - sector_drop * HYPE_SECTOR_SP_WEIGHT
-    sp_std = SP_STD * (
-        stock_vol + (sector_vol - 1.0) * HYPE_SECTOR_SP_WEIGHT
+    sp_vol = stock_vol + (sector_vol - 1.0) * HYPE_SECTOR_SP_WEIGHT
+    sp_std = SP_STD * sp_vol
+    sp_return, market_shock = simulated_sp_return(
+        sp_mean, SP_STD, sp_vol, stressed=bool(stress)
     )
-    sp_return = simulated_sp_return(sp_mean, sp_std)
-    market_shock = (sp_return - sp_mean) / sp_std
+
+    # Everything else follows the market through the normal equivalent
+    # of the S&P 500's (fat-tailed) draw.
+    market_z = normal_equivalent(market_shock)
 
     # One common shock per sector per simulated year.
     sector_shocks = {}
@@ -1014,7 +1143,7 @@ def calculate_return(
         simulated_return = simulated_individual_stock_return(
             annual_returns[i],
             sector_shocks[sector],
-            market_shock,
+            market_z,
             correlation,
             mean_shift,
             vol_mult
@@ -1031,6 +1160,8 @@ def calculate_return(
                 "std": stock_std * vol_mult,
                 "market_correlation": correlation,
                 "is_stock": True,
+                "income": STOCK_DIVIDEND_YIELDS.get(ticker, 0.0),
+                "income_type": "dividends",
             })
 
         individual_stock_return += (
@@ -1057,12 +1188,17 @@ def calculate_return(
         bond_return += (
             -bond_drop
             + STRESS_BOND_STD
-            * correlated_shock(market_shock, bond_correlation)
+            * correlated_shock(market_z, bond_correlation)
         )
 
     next_tbill_rate = simulated_tbill_return(
         tbill_rate
     ) + stress.get("tbill_rate_jump", 0.0)
+
+    # Interest the bonds earn this year (for RETURN_LOG): the T-bill
+    # rate, or the notes' yield while holding notes. The rest of
+    # bond_return is price change.
+    bond_income = tbill_rate
 
     if year is not None and year < NOTE_MATURITY_YEAR:
         bond_return += note_return(
@@ -1070,12 +1206,13 @@ def calculate_return(
             next_tbill_rate,
             NOTE_MATURITY_YEAR - year
         ) - tbill_rate
+        bond_income = note_yield(tbill_rate, NOTE_MATURITY_YEAR - year)
 
     bond_contribution = bonds * bond_return
 
     asset_return = simulated_asset_return(
         GOLD_MEAN - stress.get("gold_return_drop", 0.0),
-        market_shock,
+        market_z,
         risky_correlation or 0.0
     )
     asset_contribution = assets * asset_return
@@ -1091,6 +1228,8 @@ def calculate_return(
                     "std": sp_std,
                     "market_correlation": 1.0,
                     "is_stock": True,
+                    "income": SP_DIVIDEND_YIELD,
+                    "income_type": "dividends",
                 },
                 {
                     # Smooth within the year unless a stress test
@@ -1103,6 +1242,8 @@ def calculate_return(
                         bond_correlation if bond_drop else 0.0
                     ),
                     "is_stock": False,
+                    "income": bond_income,
+                    "income_type": "interest",
                 },
                 {
                     "weight": assets,
@@ -1111,6 +1252,8 @@ def calculate_return(
                     "std": GOLD_STD,
                     "market_correlation": risky_correlation or 0.0,
                     "is_stock": False,
+                    "income": 0.0,
+                    "income_type": None,
                 },
             ],
         })
@@ -1339,6 +1482,58 @@ def holding_sp_correlations(ticker_lists):
 
 
 STOCK_SP_CORRELATIONS = holding_sp_correlations(
+    [INITIAL_STOCKS_LIST, LATER_STOCKS_LIST]
+)
+
+
+def holding_dividend_yields(ticker_lists):
+    """
+    {ticker: average annual dividend yield} for every configured stock:
+    total return minus price-only return, averaged over the last
+    DIVIDEND_YIELD_YEARS complete years. 0 when Yahoo has no
+    dividend-adjusted prices for it (the two returns are then equal).
+    """
+
+    tickers = sorted({
+        stock_entry[0].upper()
+        for ticker_list in ticker_lists
+        for stock_entry in ticker_list
+    })
+
+    if not tickers:
+        return {}
+
+    yields = {}
+
+    print()
+    print(f"DIVIDEND YIELDS (average of the last {DIVIDEND_YIELD_YEARS} years)")
+    print("-" * 70)
+
+    for ticker in tickers:
+
+        total_by_year = stock_returns_by_year(ticker)
+        price_by_year = _price_returns_by_year_cache.get(ticker, {})
+
+        years = sorted(
+            set(total_by_year) & set(price_by_year)
+        )[-DIVIDEND_YIELD_YEARS:]
+
+        if years:
+            yields[ticker] = max(0.0, statistics.mean(
+                total_by_year[year] - price_by_year[year]
+                for year in years
+            ))
+        else:
+            yields[ticker] = 0.0
+
+        print(f"{ticker:8s} {yields[ticker]:6.2%}  [{len(years)} years]")
+
+    print("-" * 70)
+
+    return yields
+
+
+STOCK_DIVIDEND_YIELDS = holding_dividend_yields(
     [INITIAL_STOCKS_LIST, LATER_STOCKS_LIST]
 )
 
@@ -2153,6 +2348,8 @@ def simulate_path(verbose=False):
 
 def main():
 
+    global RETURN_LOG
+
     num_worked = 0
     num_times = 0
 
@@ -2180,9 +2377,21 @@ def main():
     went_all_bonds = []
     portfolio_2033_values = []
 
+    # Total $ gained from each source each year, summed over all runs.
+    source_totals = {
+        year: {source: 0.0 for source in RETURN_SOURCES}
+        for year in tracked_years
+    }
+
     for simulation in range(NUM_SIMULATIONS):
 
+        # Record each year's per-holding returns to split them by source.
+        RETURN_LOG = []
         path = simulate_path()
+
+        for year, split in return_sources(path, RETURN_LOG).items():
+            for source, amount in split.items():
+                source_totals[year][source] += amount
 
         if path["failure_year"] is not None:
             failure_count_by_year[path["failure_year"]] += 1
@@ -2214,6 +2423,8 @@ def main():
                 end="",
                 flush=True
             )
+
+    RETURN_LOG = None
 
 
     # ============================================================
@@ -2461,10 +2672,21 @@ def main():
 
     print_withdrawal_percentiles(variable_withdrawal_values)
 
+    sources_by_year = {
+        year: {
+            source: amount / num_times
+            for source, amount in source_totals[year].items()
+        }
+        for year in tracked_years
+    }
+
+    print_return_sources(sources_by_year)
+
     plot_results(
         values_by_year,
         stock_weights_by_year,
-        variable_withdrawal_values
+        variable_withdrawal_values,
+        sources_by_year
     )
 
 
@@ -2504,9 +2726,11 @@ def plot_withdrawal_percentiles(axis, withdrawals):
         linewidth=2
     )
 
-    axis.set_title("2033 variable withdrawal by percentile", loc="left")
+    axis.set_title(
+        "2033 variable withdrawal by percentile (excl. the $50k)", loc="left"
+    )
     axis.set_xlabel("Percentile of runs")
-    axis.set_ylabel("Variable withdrawal (excludes the regular $50k)")
+    axis.set_ylabel("Variable withdrawal")
     axis.yaxis.set_major_formatter(
         FuncFormatter(lambda value, _: f"${value / 1000:,.0f}k")
     )
@@ -2520,20 +2744,168 @@ def plot_withdrawal_percentiles(axis, withdrawals):
 
 
 # ============================================================
+# WHERE THE RETURNS COME FROM
+# ============================================================
+# Each holding's simulated return is split into income and price
+# change: dividends (its dividend yield; the S&P 500's is
+# SP_DIVIDEND_YIELD), bond interest (the T-bill rate or note yield),
+# and price changes (everything else, including bond price moves).
+# This only reports where gains came from; the returns themselves are
+# simulated exactly as before.
+
+RETURN_SOURCES = {
+    "dividends": "Dividends",
+    "interest": "Bond interest",
+    "price": "Price changes",
+}
+
+
+def return_sources(path, return_log):
+    """
+    {year: {"dividends": $, "interest": $, "price": $}} gained in each
+    year of one path, from the RETURN_LOG it recorded. The three add up
+    to that year's investment gain (before contributions and
+    withdrawals). Years the path never reached are left out.
+    """
+
+    sources = {}
+
+    for entry in return_log:
+        start_value = path["start_values"][entry["year"]]
+        split = {source: 0.0 for source in RETURN_SOURCES}
+
+        for holding in entry["holdings"]:
+            invested = start_value * holding["weight"]
+
+            if holding["income_type"]:
+                split[holding["income_type"]] += invested * holding["income"]
+
+            split["price"] += invested * (holding["return"] - holding["income"])
+
+        sources[entry["year"]] = split
+
+    return sources
+
+
+def print_return_sources(sources_by_year):
+    """Table of the average $ gained from each source each year."""
+
+    print()
+    print("=" * 70)
+    print("WHERE THE RETURNS CAME FROM (average per run, failed runs = $0)")
+    print("=" * 70)
+    print(
+        f"{'year':6s}"
+        + "".join(f"{label:>16s}" for label in RETURN_SOURCES.values())
+        + f"{'total':>14s}"
+    )
+
+    def money(amount, width):
+        amount = round(amount)
+        sign = "-" if amount < 0 else ""
+        return f"{sign + '$' + format(abs(amount), ','):>{width}s}"
+
+    totals = {source: 0.0 for source in RETURN_SOURCES}
+
+    for year, split in sources_by_year.items():
+        print(
+            f"{year:<6d}"
+            + "".join(money(split[source], 16) for source in RETURN_SOURCES)
+            + money(sum(split.values()), 14)
+        )
+        for source in RETURN_SOURCES:
+            totals[source] += split[source]
+
+    print("-" * 70)
+    print(
+        f"{'total':6s}"
+        + "".join(money(totals[source], 16) for source in RETURN_SOURCES)
+        + money(sum(totals.values()), 14)
+    )
+
+    gain = sum(totals.values())
+    if gain > 0:
+        print(
+            "Share of total gain: "
+            + ", ".join(
+                f"{label} {totals[source] / gain:.0%}"
+                for source, label in RETURN_SOURCES.items()
+            )
+        )
+
+    print("=" * 70)
+
+
+def plot_return_sources(axis, sources_by_year):
+    """Line graph of the average $ gained from each source by year."""
+
+    from matplotlib.ticker import FuncFormatter
+
+    years = list(sources_by_year)
+    colors = {
+        "dividends": "#2a78d6",
+        "interest": "#eb6834",
+        "price": "#1baf7a",
+    }
+
+    for source, label in RETURN_SOURCES.items():
+        axis.plot(
+            years,
+            [sources_by_year[year][source] for year in years],
+            color=colors[source],
+            linewidth=2,
+            marker="o",
+            markersize=4,
+            label=label
+        )
+
+    axis.axhline(0, color="#52514e", linewidth=0.8)
+    axis.set_title(
+        "Where the returns came from (average $ per year)", loc="left"
+    )
+    axis.set_xlabel("Year")
+    axis.set_ylabel("Average gain")
+    axis.yaxis.set_major_formatter(FuncFormatter(
+        lambda value, _: f"{'-' if value < 0 else ''}${abs(value) / 1000:,.0f}k"
+    ))
+    axis.set_xticks(years)
+    axis.tick_params(axis="x", rotation=45)
+    axis.legend(frameon=False)
+    axis.grid(axis="y", color="#e5e4df", linewidth=0.8)
+    axis.set_axisbelow(True)
+    for side in ("top", "right"):
+        axis.spines[side].set_visible(False)
+
+
+# ============================================================
 # GRAPHS
 # ============================================================
+
+# Text sizes for the graph window (matplotlib's defaults crowd a
+# four-graph window on a laptop screen).
+GRAPH_TEXT_SIZES = {
+    "font.size": 9,
+    "axes.titlesize": 10,
+    "axes.labelsize": 9,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "legend.fontsize": 8,
+}
+
 
 def plot_results(
     values_by_year,
     stock_weights_by_year,
-    variable_withdrawals
+    variable_withdrawals,
+    sources_by_year
 ):
     """
-    Three line graphs: the 10th/50th/90th percentile portfolio value by
+    Four line graphs: the 10th/50th/90th percentile portfolio value by
     year, the average percent of the portfolio in stocks by year (S&P
-    500 plus individual stocks and funds; the rest is bonds), and the
-    2033 variable withdrawal by percentile. Failed paths count as $0 in
-    the first graph and are left out of the second.
+    500 plus individual stocks and funds; the rest is bonds), the 2033
+    variable withdrawal by percentile, and the average $ gained from
+    dividends, bond interest and price changes by year. Failed paths
+    count as $0 in the first graph and are left out of the second.
     """
 
     # Only needed here, so the optimizer can import this file without it.
@@ -2548,8 +2920,11 @@ def plot_results(
         (0.10, "10th percentile", "#86b6ef"),
     ]
 
-    figure, (value_axis, stock_axis, withdrawal_axis) = plt.subplots(
-        1, 3, figsize=(20, 5.5)
+    # Constrained layout re-fits the spacing whenever the window is
+    # resized, so labels don't overlap on smaller screens.
+    plt.rcParams.update(GRAPH_TEXT_SIZES)
+    figure, ((value_axis, stock_axis), (withdrawal_axis, sources_axis)) = (
+        plt.subplots(2, 2, figsize=(13, 8.5), layout="constrained")
     )
 
     # --------------------------------------------------------
@@ -2562,15 +2937,12 @@ def plot_results(
             for year in years
         ]
 
+        # The 2042 value goes in the legend: as labels at the line ends
+        # they overlap when the lines finish close together.
         value_axis.plot(
             years, line, color=color, linewidth=2,
-            marker="o", markersize=4, label=label
-        )
-
-        value_axis.annotate(
-            f"${line[-1] / 1000:,.0f}k", (years[-1], line[-1]),
-            xytext=(6, 0), textcoords="offset points",
-            va="center", fontsize=9, color="#52514e"
+            marker="o", markersize=4,
+            label=f"{label} (${line[-1] / 1000:,.0f}k in {years[-1]})"
         )
 
     value_axis.set_title("Portfolio value by year", loc="left")
@@ -2612,8 +2984,8 @@ def plot_results(
             axis.spines[side].set_visible(False)
 
     plot_withdrawal_percentiles(withdrawal_axis, variable_withdrawals)
+    plot_return_sources(sources_axis, sources_by_year)
 
-    figure.tight_layout()
     plt.show()
 
 
