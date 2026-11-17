@@ -61,6 +61,12 @@ LATER_STOCKS_LIST = INITIAL_STOCKS_LIST
 #                       make money and collapses: -20% with 2x
 #                       volatility. Defensive sectors get +2%, the rest
 #                       of the market is left alone
+#   "us_stock_crash"    US stocks turn out to be overvalued and fall:
+#                       the S&P 500 and US holdings -25% with 2x
+#                       volatility. International holdings (see
+#                       INTERNATIONAL_FUNDS) and bonds are unaffected
+#   "stock_crash"       stocks everywhere fall: -25% with 2x volatility,
+#                       US and international alike. Bonds are unaffected
 #
 # "Stocks -15%" means 15 points off the expected return (the S&P 500's
 # 11% becomes -4%). Individual holdings lose that times their historical
@@ -101,6 +107,8 @@ STRESS_BOND_STD = 0.06
 #   sector_return_drop       subtracted from HYPE_SECTORS holdings
 #   sector_vol_mult          multiplies the size of HYPE_SECTORS losses
 #   defensive_return_boost   added to DEFENSIVE_SECTORS holdings
+#   us_stocks_only           stock_return_drop / stock_vol_mult skip
+#                            international holdings
 SCENARIOS = {
     "normal": {},
     "oil_shock": {
@@ -127,6 +135,15 @@ SCENARIOS = {
         "sector_return_drop": 0.20,
         "sector_vol_mult": 2.0,
         "defensive_return_boost": 0.02,
+    },
+    "us_stock_crash": {
+        "stock_return_drop": 0.25,
+        "stock_vol_mult": 2.0,
+        "us_stocks_only": True,
+    },
+    "stock_crash": {
+        "stock_return_drop": 0.25,
+        "stock_vol_mult": 2.0,
     },
 }
 
@@ -322,6 +339,18 @@ SECTOR_FUNDS = {
     "XLB": "Basic Materials", "VAW": "Basic Materials",
     "XLRE": "Real Estate", "XLC": "Communication Services",
 }
+
+# Holdings outside the US, for the "us_stock_crash" scenario. Stocks are
+# classified at startup from Yahoo's company profile (its country) and
+# stored in INTERNATIONAL_HOLDINGS. Funds have no profile, so
+# international funds are listed here; any other fund counts as US
+# (including global funds such as VT, which are about 60% US).
+INTERNATIONAL_FUNDS = {
+    "VEA", "VEU", "VXUS", "VWO", "VEXC", "VGK", "VPL", "EFA", "IEFA",
+    "EEM", "IEMG", "IXUS", "ACWX", "SCHF", "SCHE", "SPDW", "EWJ", "EWZ",
+    "FXI", "MCHI", "INDA",
+}
+INTERNATIONAL_HOLDINGS = set()
 
 # Winsorization limits for historical stock returns.
 STOCK_LOWER_PERCENTILE = 0.05
@@ -1126,13 +1155,18 @@ def calculate_return(
         if risky_correlation is not None:
             correlation = risky_correlation
 
-        # Market-wide stress hits each holding by its beta; a hype
-        # crash hits only the hyped sector and lifts defensive ones.
-        mean_shift = -stock_drop * STOCK_SP_BETAS.get(
-            ticker,
-            STOCK_DEFAULT_SP_BETA
-        )
-        vol_mult = stock_vol
+        # Market-wide stress hits each holding by its beta (a US-only
+        # crash skips international holdings); a hype crash hits only
+        # the hyped sector and lifts defensive ones.
+        if stress.get("us_stocks_only") and ticker in INTERNATIONAL_HOLDINGS:
+            mean_shift = 0.0
+            vol_mult = 1.0
+        else:
+            mean_shift = -stock_drop * STOCK_SP_BETAS.get(
+                ticker,
+                STOCK_DEFAULT_SP_BETA
+            )
+            vol_mult = stock_vol
 
         if sector in HYPE_SECTORS:
             mean_shift -= sector_drop
@@ -1565,6 +1599,34 @@ def detect_sectors(ticker_lists):
             STOCK_SECTORS[ticker] = sector or DEFAULT_STOCK_SECTOR
 
 
+def detect_regions(ticker_lists):
+    """
+    Fill INTERNATIONAL_HOLDINGS: funds in INTERNATIONAL_FUNDS, and stocks
+    whose Yahoo profile lists a country other than the United States.
+    """
+
+    for ticker_list in ticker_lists:
+        for entry in ticker_list:
+            ticker = entry[0].upper()
+
+            if ticker in INTERNATIONAL_FUNDS:
+                INTERNATIONAL_HOLDINGS.add(ticker)
+                continue
+
+            if ticker in SECTOR_FUNDS or usstock is None:
+                continue
+
+            try:
+                country = usstock.overview(
+                    ticker.replace(".", "-")
+                ).get("assetProfile", {}).get("country")
+            except Exception:
+                country = None
+
+            if country and country != "United States":
+                INTERNATIONAL_HOLDINGS.add(ticker)
+
+
 def scenario_for_year(year):
     """The active scenario's settings if `year` is stressed, else {}."""
 
@@ -1580,6 +1642,8 @@ def scenario_for_year(year):
 if AUTO_DETECT_SECTORS:
     detect_sectors([INITIAL_STOCKS_LIST, LATER_STOCKS_LIST])
 
+detect_regions([INITIAL_STOCKS_LIST, LATER_STOCKS_LIST])
+
 holding_sectors = {
     entry[0].upper(): get_stock_sector(entry)
     for ticker_list in (INITIAL_STOCKS_LIST, LATER_STOCKS_LIST)
@@ -1591,7 +1655,8 @@ if holding_sectors:
     print("SECTORS")
     print("-" * 70)
     for ticker, sector in sorted(holding_sectors.items()):
-        print(f"{ticker:8s} {sector}")
+        region = "international" if ticker in INTERNATIONAL_HOLDINGS else "US"
+        print(f"{ticker:8s} {sector:28s} {region}")
     print("-" * 70)
 
 if MARKET_SCENARIO not in SCENARIOS:
@@ -1610,7 +1675,7 @@ if MARKET_SCENARIO != "normal":
     )
     print(f"STRESS TEST: {MARKET_SCENARIO}, {years}")
     for key, value in SCENARIOS[MARKET_SCENARIO].items():
-        print(f"  {key}: {value:g}")
+        print(f"  {key}: {value}")
     if MARKET_SCENARIO == "hype_crash":
         for label, sectors in (
             ("hyped", HYPE_SECTORS),
@@ -2685,7 +2750,8 @@ def main():
         values_by_year,
         stock_weights_by_year,
         variable_withdrawal_values,
-        sources_by_year
+        sources_by_year,
+        final_values
     )
 
 
@@ -2877,8 +2943,120 @@ def plot_return_sources(axis, sources_by_year):
 
 
 # ============================================================
+# DISTRIBUTIONS
+# ============================================================
+
+def short_dollars(amount):
+    """$950k, $1.2M: compact axis and label text."""
+    if abs(amount) >= 1e6:
+        return f"${amount / 1e6:,.1f}M"
+    return f"${amount / 1000:,.0f}k"
+
+
+def plot_histogram(axis, values, title, xlabel):
+    """
+    Bar graph of how often each value happened: the percent of runs
+    in each HISTOGRAM_BIN_WIDTH-wide range.
+    """
+
+    from matplotlib.ticker import FuncFormatter
+
+    # Too spread out for the normal bar width: show up to the clip
+    # percentile and put the rest in one "above" bar.
+    shown_max = max(values)
+    if (shown_max - min(values)) / HISTOGRAM_BIN_WIDTH > HISTOGRAM_MAX_BINS:
+        shown_max = percentile_value(values, HISTOGRAM_CLIP_PERCENTILE)
+
+    # Widen the bars (to a multiple of the setting) only if the normal
+    # width would still need too many of them.
+    spread = shown_max - min(values)
+    width = HISTOGRAM_BIN_WIDTH * max(
+        1, math.ceil(spread / HISTOGRAM_BIN_WIDTH / HISTOGRAM_MAX_BINS)
+    )
+
+    low = math.floor(min(values) / width) * width
+    high = (math.floor(shown_max / width) + 1) * width
+    edges = numpy.arange(low, high + width / 2, width)
+
+    shown = [value for value in values if value < high]
+    counts, _ = numpy.histogram(shown, edges)
+    percents = 100 * counts / len(values)
+
+    axis.bar(
+        edges[:-1], percents, width=width, align="edge",
+        color="#2a78d6", edgecolor="#fcfcfb", linewidth=0.6
+    )
+
+    above = 100 * (len(values) - len(shown)) / len(values)
+    if above:
+        axis.bar(
+            high, above, width=width, align="edge",
+            color="#86b6ef", edgecolor="#fcfcfb", linewidth=0.6
+        )
+        axis.annotate(
+            f"{above:.1f}% of runs\nabove {short_dollars(high)}",
+            (high + width / 2, above), xytext=(0, 4),
+            textcoords="offset points", ha="right", va="bottom",
+            fontsize=8, color="#52514e"
+        )
+        high += width
+
+    axis.set_title(title, loc="left")
+    axis.set_xlabel(xlabel)
+    axis.set_ylabel("% of runs")
+    axis.xaxis.set_major_formatter(
+        FuncFormatter(lambda value, _: short_dollars(value))
+    )
+    axis.set_xlim(low, high)
+    axis.grid(axis="y", color="#e5e4df", linewidth=0.8)
+    axis.set_axisbelow(True)
+    for side in ("top", "right"):
+        axis.spines[side].set_visible(False)
+
+
+def plot_distributions(variable_withdrawals, final_values):
+    """
+    A second window with how often each 2033 variable withdrawal and
+    each 2042 portfolio value happened across all runs. Failed runs
+    count as $0 in the final-value graph.
+    """
+
+    import matplotlib.pyplot as plt
+
+    figure, (withdrawal_axis, final_axis) = plt.subplots(
+        1, 2, figsize=(13, 4.8), layout="constrained"
+    )
+
+    plot_histogram(
+        withdrawal_axis,
+        variable_withdrawals,
+        "2033 variable withdrawals",
+        "Variable withdrawal (excl. the $50k)"
+    )
+    plot_histogram(
+        final_axis,
+        final_values,
+        f"Final portfolio values ({tracked_years[-1]})",
+        "Portfolio value (failed runs = $0)"
+    )
+
+
+# ============================================================
 # GRAPHS
 # ============================================================
+
+# Bar width of the withdrawal and final-value distribution graphs. If
+# the values spread so far that this would take more than
+# HISTOGRAM_MAX_BINS bars (e.g. a 100% TSLA portfolio), the bars widen
+# to a multiple of it.
+HISTOGRAM_BIN_WIDTH = 5000
+HISTOGRAM_MAX_BINS = 200
+
+# When the values are too spread out for HISTOGRAM_BIN_WIDTH bars, the
+# graph only spans up to this percentile and one extra bar collects the
+# rare runs above it (otherwise a few huge runs squash everything else
+# against the left edge).
+HISTOGRAM_CLIP_PERCENTILE = 0.99
 
 # Text sizes for the graph window (matplotlib's defaults crowd a
 # four-graph window on a laptop screen).
@@ -2896,7 +3074,8 @@ def plot_results(
     values_by_year,
     stock_weights_by_year,
     variable_withdrawals,
-    sources_by_year
+    sources_by_year,
+    final_values
 ):
     """
     Four line graphs: the 10th/50th/90th percentile portfolio value by
@@ -2905,6 +3084,9 @@ def plot_results(
     variable withdrawal by percentile, and the average $ gained from
     dividends, bond interest and price changes by year. Failed paths
     count as $0 in the first graph and are left out of the second.
+
+    A second window shows how often each 2033 variable withdrawal and
+    each 2042 portfolio value happened (see plot_distributions).
     """
 
     # Only needed here, so the optimizer can import this file without it.
@@ -2984,6 +3166,8 @@ def plot_results(
 
     plot_withdrawal_percentiles(withdrawal_axis, variable_withdrawals)
     plot_return_sources(sources_axis, sources_by_year)
+
+    plot_distributions(variable_withdrawals, final_values)
 
     plt.show()
 
