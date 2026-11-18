@@ -14,20 +14,27 @@ from collections import defaultdict
 # PORTFOLIO ALLOCATIONS
 # ============================================================
 
-INITIAL_PERCENT_S_AND_P = 0.0
-INITIAL_PERCENT_BONDS = 0.0
+INITIAL_PERCENT_S_AND_P = 0.5
+INITIAL_PERCENT_BONDS = 0.4
 INITIAL_PERCENT_ASSETS = 0.0
 
-INITIAL_STOCKS_LIST = [("TSLA", 1.0)]
+INITIAL_STOCKS_LIST = [("VTIAX", 0.1)]
 
-# Phase 2 (2033-2042) holds the same investments in the same proportions
-# as phase 1. Only the stock-vs-bond split differs: for runs that stay
-# invested after 2033 it is set each year by determine_later_allocation
-# from what the remaining withdrawals need.
+# Phase 2 (2033-2042) holds these investments in these proportions; by
+# default the same as phase 1 (replace them with numbers / a list for a
+# different phase 2 mix).
 LATER_PERCENT_S_AND_P = INITIAL_PERCENT_S_AND_P
 LATER_PERCENT_BONDS = INITIAL_PERCENT_BONDS
 LATER_PERCENT_ASSETS = INITIAL_PERCENT_ASSETS
 LATER_STOCKS_LIST = INITIAL_STOCKS_LIST
+
+# True: the phase 2 stock-vs-bond split is set each year by
+# determine_later_allocation from what the remaining withdrawals need
+# (100% bonds while bonds alone can fund them, moving into the stocks
+# above only when a run falls behind).
+# False: every phase 2 year uses exactly the LATER_* percentages above,
+# rebalanced back to them each year.
+DYNAMIC_PHASE_2_ALLOCATION = False
 
 # ============================================================
 # MARKET SCENARIO (STRESS TEST)
@@ -2330,17 +2337,24 @@ def simulate_path(verbose=False):
             for _ in range(9 - j)
         ]
 
-        # Re-checked every year, so a run that falls behind (for
-        # example, T-bill rates stay low) can move into stocks in time.
-        (
-            later_sp,
-            later_bonds,
-            later_assets,
-            later_stocks
-        ) = determine_later_allocation(
-            portfolio_value,
-            remaining_withdrawals
-        )
+        if DYNAMIC_PHASE_2_ALLOCATION:
+            # Re-checked every year, so a run that falls behind (for
+            # example, T-bill rates stay low) can move into stocks in
+            # time.
+            (
+                later_sp,
+                later_bonds,
+                later_assets,
+                later_stocks
+            ) = determine_later_allocation(
+                portfolio_value,
+                remaining_withdrawals
+            )
+        else:
+            later_sp = LATER_PERCENT_S_AND_P
+            later_bonds = LATER_PERCENT_BONDS
+            later_assets = LATER_PERCENT_ASSETS
+            later_stocks = LATER_STOCKS_LIST
 
         portfolio_value -= current_withdrawal
 
@@ -2718,8 +2732,12 @@ def main():
     )
 
     for label, group in (
-        (f"Above ${WITHDRAWAL_RETAINED_VALUE:,.0f} -> starts in T-bills", bond_finals),
-        (f"At/below ${WITHDRAWAL_RETAINED_VALUE:,.0f} -> starts in stock/bond mix", stock_finals),
+        (f"Above ${WITHDRAWAL_RETAINED_VALUE:,.0f}"
+         + (" -> starts in T-bills" if DYNAMIC_PHASE_2_ALLOCATION else ""),
+         bond_finals),
+        (f"At/below ${WITHDRAWAL_RETAINED_VALUE:,.0f}"
+         + (" -> starts in stock/bond mix" if DYNAMIC_PHASE_2_ALLOCATION else ""),
+         stock_finals),
     ):
         if not group:
             print(f"{label}: 0 paths")

@@ -170,6 +170,7 @@ def simulate_quarterly_path(model, rng, verbose=False):
     values, stock_pct = split_path(model, path, return_log, rng)
     path["quarter_values"] = values
     path["quarter_stock_pct"] = stock_pct
+    path["return_sources"] = model.return_sources(path, return_log)
     return path
 
 
@@ -202,6 +203,10 @@ def main(model, seed=None):
     variable_withdrawals = []
     final_values = []
     failures = 0
+    source_totals = {
+        year: {source: 0.0 for source in model.RETURN_SOURCES}
+        for year in model.tracked_years
+    }
 
     for simulation in range(1, model.NUM_SIMULATIONS + 1):
         path = simulate_quarterly_path(model, rng)
@@ -214,6 +219,10 @@ def main(model, seed=None):
         variable_withdrawals.append(path["variable_withdrawal"])
         final_values.append(path["final_value"])
         failures += not path["success"]
+
+        for year, split in path["return_sources"].items():
+            for source, amount in split.items():
+                source_totals[year][source] += amount
 
         if simulation % 100 == 0 or simulation == model.NUM_SIMULATIONS:
             print(
@@ -269,7 +278,27 @@ def main(model, seed=None):
 
     print("=" * 70)
 
-    plot_results(model, values_by_quarter, stock_pct_by_quarter)
+    model.print_withdrawal_percentiles(variable_withdrawals)
+
+    # Return sources are reported by year, the same as the annual sim.
+    sources_by_year = {
+        year: {
+            source: amount / count
+            for source, amount in source_totals[year].items()
+        }
+        for year in model.tracked_years
+    }
+
+    model.print_return_sources(sources_by_year)
+
+    plot_results(
+        model,
+        values_by_quarter,
+        stock_pct_by_quarter,
+        variable_withdrawals,
+        sources_by_year,
+        final_values
+    )
 
 
 # ============================================================
@@ -319,11 +348,20 @@ def run_single(model, seed=None):
 # GRAPHS
 # ============================================================
 
-def plot_results(model, values_by_quarter, stock_pct_by_quarter):
+def plot_results(
+    model,
+    values_by_quarter,
+    stock_pct_by_quarter,
+    variable_withdrawals,
+    sources_by_year,
+    final_values
+):
     """
-    Quarterly versions of the annual sims' two graphs: 10th/50th/90th
+    Quarterly versions of the annual sims' graphs: 10th/50th/90th
     percentile portfolio value at each quarter end, and the average
-    percent in stocks at the start of each quarter.
+    percent in stocks at the start of each quarter. The 2033 variable
+    withdrawal by percentile and the return sources by year are the
+    same graphs as the annual sims'.
     """
 
     # Only needed here, so the sims can be imported without it.
@@ -341,8 +379,11 @@ def plot_results(model, values_by_quarter, stock_pct_by_quarter):
         (0.10, "10th percentile", "#86b6ef"),
     ]
 
-    figure, (value_axis, stock_axis) = plt.subplots(
-        1, 2, figsize=(15, 5.5)
+    # Constrained layout re-fits the spacing whenever the window is
+    # resized, so labels don't overlap on smaller screens.
+    plt.rcParams.update(model.GRAPH_TEXT_SIZES)
+    figure, ((value_axis, stock_axis), (withdrawal_axis, sources_axis)) = (
+        plt.subplots(2, 2, figsize=(13, 8.5), layout="constrained")
     )
 
     for percentile, line_label, color in percentile_lines:
@@ -351,14 +392,11 @@ def plot_results(model, values_by_quarter, stock_pct_by_quarter):
             for key in keys
         ]
 
+        # The final value goes in the legend: as labels at the line ends
+        # they overlap when the lines finish close together.
         value_axis.plot(
-            positions, line, color=color, linewidth=2, label=line_label
-        )
-
-        value_axis.annotate(
-            f"${line[-1] / 1000:,.0f}k", (positions[-1], line[-1]),
-            xytext=(6, 0), textcoords="offset points",
-            va="center", fontsize=9, color="#52514e"
+            positions, line, color=color, linewidth=2,
+            label=f"{line_label} (${line[-1] / 1000:,.0f}k at the end)"
         )
 
     value_axis.set_title("Portfolio value by quarter", loc="left")
@@ -393,5 +431,10 @@ def plot_results(model, values_by_quarter, stock_pct_by_quarter):
         for side in ("top", "right"):
             axis.spines[side].set_visible(False)
 
-    figure.tight_layout()
+    model.plot_withdrawal_percentiles(withdrawal_axis, variable_withdrawals)
+    model.plot_return_sources(sources_axis, sources_by_year)
+
+    # Same distribution graphs as the annual sims (a second window).
+    model.plot_distributions(variable_withdrawals, final_values)
+
     plt.show()

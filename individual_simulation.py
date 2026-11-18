@@ -57,7 +57,9 @@ print(
 print(
     f"2033-2042 allocation:  "
     + (
-        "starts in T-bills, stocks only if it falls behind"
+        "fixed phase 2 percentages, rebalanced each year"
+        if not model.DYNAMIC_PHASE_2_ALLOCATION
+        else "starts in T-bills, stocks only if it falls behind"
         if path["all_bonds_after_2033"]
         else "stock/bond mix adjusted each year"
     )
